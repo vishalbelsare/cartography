@@ -1,0 +1,1047 @@
+from typing import NamedTuple
+
+from cartography.graph.analysis import AddRelationship
+from cartography.graph.analysis import AnalysisJob
+from cartography.graph.analysis import AnalysisStatement
+from cartography.graph.analysis import CypherValue
+from cartography.graph.analysis import IncrementalMatch
+from cartography.graph.analysis import RawCypher
+from cartography.graph.analysis import SetProperty
+from cartography.graph.analysis import SetRelationshipPropertyIfMissing
+from cartography.graph.analysis import Var
+
+AWS_USER_PROJECTION = AnalysisJob(
+    name="Ontology - AWS user projection",
+    short_name="ontology_aws_user_projection",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (u:AWSUser)",
+            effects=(
+                SetProperty(
+                    "u",
+                    "_ont_has_mfa",
+                    RawCypher("EXISTS((u)-[:MFA_DEVICE]->(:AWSMfaDevice))"),
+                    label="AWSUser",
+                ),
+            ),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:AWSUser)",
+            effects=(
+                SetProperty(
+                    "u",
+                    "_ont_active",
+                    RawCypher(
+                        "CASE WHEN (u.passwordlastused_dt IS NOT NULL) OR EXISTS((u)-[:AWS_ACCESS_KEY]->(:AWSAccountAccessKey {status: 'Active'})) THEN true ELSE NULL END"
+                    ),
+                    label="AWSUser",
+                ),
+            ),
+        ),
+    ),
+)
+# TODO: Normalize CrowdStrike and Jamf source emails during ingestion before
+# moving their device ownership joins to User.normalized_email; test Unicode
+# whitespace consistently on both sides and cleanup across update tags.
+DEVICE_OWNS_LINKING = AnalysisJob(
+    name="Ontology - Devices OWNS relationship linking",
+    short_name="ontology_devices_linking",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (host:CrowdstrikeHost)<-[obs:OBSERVED_AS]-(d:Device) WHERE host.email IS NOT NULL AND trim(host.email) <> '' WITH d, toLower(trim(host.email)) AS host_email MATCH (u:User) WHERE u.email IS NOT NULL AND trim(u.email) <> '' AND toLower(trim(u.email)) = host_email",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:DuoUser)-[:HAS_DUO_PHONE]-(:DuoPhone)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:DuoUser)-[:HAS_DUO_ENDPOINT]-(:DuoEndpoint)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:SnipeitUser)-[:HAS_CHECKED_OUT]-(:SnipeitAsset)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:TailscaleUser)-[:OWNS]-(:TailscaleDevice)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:GoogleWorkspaceUser)-[:OWNS]-(:GoogleWorkspaceDevice)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:OktaUser)-[:OWNS]->(:OktaDevice)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (j)<-[obs:OBSERVED_AS]-(d:Device) WHERE (j:JamfComputer OR j:JamfMobileDevice) AND j.email IS NOT NULL AND trim(j.email) <> '' WITH d, toLower(trim(j.email)) AS jamf_email MATCH (u:User) WHERE u.email IS NOT NULL AND trim(u.email) <> '' AND toLower(trim(u.email)) = jamf_email",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:EntraUser)-[:ENROLLED_TO]->(device:IntuneManagedDevice)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=(
+                "d",
+                "device",
+                IncrementalMatch("obs", relationship=True),
+            ),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:JumpCloudUser)-[:OWNS]->(:JumpCloudSystem)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:MiradoreUser)-[:OWNS]->(:MiradoreDevice)<-[obs:OBSERVED_AS]-(d:Device)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "d", source_label="User", target_label="Device"
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+    ),
+)
+DEVICE_AFFECTS_S1_FINDING = AnalysisJob(
+    name="Ontology - S1AppFinding AFFECTS Device linking",
+    short_name="ontology_devices_s1_app_finding_affects",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (d:Device)-[obs:OBSERVED_AS]->(:S1Agent)<-[:AFFECTS]-(f:S1AppFinding)",
+            effects=(
+                AddRelationship(
+                    "f",
+                    "AFFECTS",
+                    "d",
+                    source_label="S1AppFinding",
+                    target_label="Device",
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+    ),
+)
+DEVICE_AFFECTS_HUNTRESS_INCIDENT_REPORT = AnalysisJob(
+    name="Ontology - HuntressIncidentReport AFFECTS Device linking",
+    short_name="ontology_devices_huntress_incident_report_affects",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (d:Device)-[obs:OBSERVED_AS]->(:HuntressAgent)<-[:AFFECTS]-(f:HuntressIncidentReport)",
+            effects=(
+                AddRelationship(
+                    "f",
+                    "AFFECTS",
+                    "d",
+                    source_label="HuntressIncidentReport",
+                    target_label="Device",
+                ),
+            ),
+            incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+        ),
+    ),
+)
+DEVICE_LINKING_JOBS = (
+    DEVICE_OWNS_LINKING,
+    DEVICE_AFFECTS_S1_FINDING,
+    DEVICE_AFFECTS_HUNTRESS_INCIDENT_REPORT,
+)
+# An ingress host rule names the hostname, but DNS resolves that name to the load
+# balancer the controller provisions, never to the Ingress object. A shared name says
+# nothing about which load balancer serves the traffic: the record can alias a separate
+# load balancer bound through a TargetGroupBinding. Only host records match: an NS
+# record with the same name delegates a zone and says nothing about the host.
+_INGRESS_HOST_RECORD_TYPES = "['A', 'AAAA', 'CNAME', 'ALIAS']"
+DNS_RECORD_TO_KUBERNETES_INGRESS = AnalysisJob(
+    name="Ontology - DNSRecord to KubernetesIngress linking",
+    short_name="ontology_dnsrecords_kubernetes_ingress",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            # DEPRECATED: the host_names fallback covers ingresses loaded before
+            # host_names_normalized existed, until their next Kubernetes sync. Will be
+            # removed in v1.0.0.
+            match=f"MATCH (ing:KubernetesIngress) UNWIND coalesce(ing.host_names_normalized, [host IN ing.host_names | toLower(rtrim(trim(host), '.'))]) AS hostname MATCH (dns:DNSRecord {{_ont_name: hostname}}) WHERE dns._ont_type IS NULL OR toUpper(dns._ont_type) IN {_INGRESS_HOST_RECORD_TYPES}",
+            effects=(
+                AddRelationship(
+                    "ing",
+                    "MATCHES_HOSTNAME",
+                    "dns",
+                    source_label="KubernetesIngress",
+                    target_label="DNSRecord",
+                    rel_alias="m",
+                ),
+                # DEPRECATED: hostname correlation, not DNS resolution; replaced by
+                # (:KubernetesIngress)-[:MATCHES_HOSTNAME]->(:DNSRecord). Will be
+                # removed in v1.0.0.
+                AddRelationship(
+                    "dns",
+                    "DNS_POINTS_TO",
+                    "ing",
+                    source_label="DNSRecord",
+                    target_label="KubernetesIngress",
+                ),
+            ),
+        ),
+    ),
+)
+DNS_RECORD_TO_RAILWAY_CUSTOM_DOMAIN = AnalysisJob(
+    name="Ontology - DNSRecord to RailwayCustomDomain linking",
+    short_name="ontology_dnsrecords_railway_custom_domain",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            match="MATCH (domain:RailwayCustomDomain) WHERE domain.verified = true AND domain.domain_normalized IS NOT NULL WITH domain MATCH (dns:DNSRecord {_ont_name: domain.domain_normalized}) WHERE dns._ont_type IS NULL OR toUpper(dns._ont_type) IN ['A', 'AAAA', 'CNAME']",
+            effects=(
+                AddRelationship(
+                    "dns",
+                    "DNS_POINTS_TO",
+                    "domain",
+                    source_label="DNSRecord",
+                    target_label="RailwayCustomDomain",
+                ),
+            ),
+        ),
+    ),
+)
+BBOT_DNS_MATCHES_PROVIDER = AnalysisJob(
+    name="Ontology - BbotDNSName to provider DNSRecord linking",
+    short_name="ontology_bbot_dns_matches_provider",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (bbot:BbotDNSName) WHERE bbot._ont_name IS NOT NULL WITH bbot MATCH (provider:DNSRecord {_ont_name: bbot._ont_name}) WHERE NOT provider:BbotDNSName",
+            effects=(
+                AddRelationship(
+                    "bbot",
+                    "MATCHES_DNS_RECORD",
+                    "provider",
+                    source_label="BbotDNSName",
+                    target_label="DNSRecord",
+                ),
+            ),
+        ),
+    ),
+)
+
+
+class DNSRecordTarget(NamedTuple):
+    label: str
+    # Hostname properties on the target. Legacy targets store raw provider values, so
+    # their match normalizes both sides at query time and cannot use an index.
+    # Normalized targets store canonical hostnames at ingestion and match by equality
+    # against the indexed DNSRecord._ont_target_hostname.
+    properties: tuple[str, ...]
+    match_filter: str = "AND NOT dns:GCPRecordSet"
+    cleanup_where: str = ""
+    normalized: bool = False
+    # Normalized list-valued hostname properties, such as Netlify domain aliases.
+    list_properties: tuple[str, ...] = ()
+
+
+_ROUTE53_EXCLUDED_FILTER = "AND NOT dns:AWSDNSRecord AND NOT dns:GCPRecordSet"
+_ROUTE53_CLEANUP_WHERE = "NOT source:AWSDNSRecord"
+
+DNS_RECORD_TARGETS = (
+    DNSRecordTarget(
+        "AWSLoadBalancerV2",
+        ("dnsname",),
+        _ROUTE53_EXCLUDED_FILTER,
+        _ROUTE53_CLEANUP_WHERE,
+    ),
+    DNSRecordTarget(
+        "AWSLoadBalancer",
+        ("dnsname",),
+        _ROUTE53_EXCLUDED_FILTER,
+        _ROUTE53_CLEANUP_WHERE,
+    ),
+    DNSRecordTarget("AWSCloudFrontDistribution", ("domain_name",)),
+    DNSRecordTarget(
+        "AWSEC2Instance",
+        ("publicdnsname",),
+        _ROUTE53_EXCLUDED_FILTER,
+        _ROUTE53_CLEANUP_WHERE,
+    ),
+    DNSRecordTarget("GCPInstance", ("hostname",)),
+    DNSRecordTarget("AzureAppService", ("default_host_name",)),
+    DNSRecordTarget("AzureFunctionApp", ("default_host_name",)),
+    DNSRecordTarget("RailwayServiceDomain", ("domain_normalized",), normalized=True),
+    DNSRecordTarget(
+        "ModalSandboxTunnel",
+        ("host_normalized", "unencrypted_host_normalized"),
+        normalized=True,
+    ),
+    DNSRecordTarget("ModalFunction", ("web_hostname",), normalized=True),
+    DNSRecordTarget("GCPCloudRunService", ("uri_hostname",), normalized=True),
+    DNSRecordTarget(
+        "NetlifySite",
+        ("default_domain_normalized", "custom_domain_normalized"),
+        normalized=True,
+        list_properties=("domain_aliases_normalized",),
+    ),
+    DNSRecordTarget(
+        "ScalewayServerlessContainer",
+        ("domain_name_normalized",),
+        normalized=True,
+    ),
+    DNSRecordTarget(
+        "ScalewayServerlessFunction",
+        ("domain_name_normalized",),
+        normalized=True,
+    ),
+)
+
+
+def _dns_record_target_matches(target: DNSRecordTarget) -> tuple[str, ...]:
+    label = target.label
+    if not target.normalized:
+        return tuple(
+            match
+            for prop in target.properties
+            for match in (
+                f"MATCH (dns:DNSRecord) WHERE dns._ont_value IS NOT NULL {target.match_filter} WITH dns MATCH (target:{label}) WHERE toLower(rtrim(toString(dns._ont_value), '.')) = toLower(rtrim(target.{prop}, '.'))",
+                f"MATCH (dns:GCPRecordSet) WHERE dns.data IS NOT NULL UNWIND dns.data AS val WITH dns, val MATCH (target:{label}) WHERE toLower(rtrim(val, '.')) = toLower(rtrim(target.{prop}, '.'))",
+            )
+        )
+
+    gcp_hostnames = "MATCH (dns:GCPRecordSet) WHERE dns._ont_target_hostnames IS NOT NULL UNWIND dns._ont_target_hostnames AS hostname WITH dns, hostname"
+    scalar_matches = tuple(
+        match
+        for prop in target.properties
+        for match in (
+            f"MATCH (target:{label}) WHERE target.{prop} IS NOT NULL WITH target MATCH (dns:DNSRecord {{_ont_target_hostname: target.{prop}}}) WHERE true {target.match_filter}",
+            f"{gcp_hostnames} MATCH (target:{label}) WHERE hostname = target.{prop}",
+        )
+    )
+    # GCPRecordSet hostnames are list-valued and a list property cannot be indexed, so
+    # the GCP side of a list match scans the target label.
+    list_matches = tuple(
+        match
+        for prop in target.list_properties
+        for match in (
+            f"MATCH (target:{label}) WHERE target.{prop} IS NOT NULL UNWIND target.{prop} AS hostname WITH target, hostname MATCH (dns:DNSRecord {{_ont_target_hostname: hostname}}) WHERE true {target.match_filter}",
+            f"{gcp_hostnames} MATCH (target:{label}) WHERE hostname IN target.{prop}",
+        )
+    )
+    return scalar_matches + list_matches
+
+
+DNS_RECORD_LINKING_JOBS = (
+    DNS_RECORD_TO_KUBERNETES_INGRESS,
+    DNS_RECORD_TO_RAILWAY_CUSTOM_DOMAIN,
+    BBOT_DNS_MATCHES_PROVIDER,
+) + tuple(
+    AnalysisJob(
+        name=f"Ontology - DNSRecord to {target.label} linking",
+        short_name=f"ontology_dnsrecords_{target.label.lower()}",
+        cleanup_iterationsize=1000,
+        statements=tuple(
+            AnalysisStatement(
+                match=match,
+                effects=(
+                    AddRelationship(
+                        "dns",
+                        "DNS_POINTS_TO",
+                        "target",
+                        # Every statement declares the same effect, cleanup_where
+                        # included, so their cleanups dedupe into a single guarded
+                        # delete. GCPRecordSet carries the DNSRecord label and is never
+                        # an AWSDNSRecord, so that one delete also covers the GCP edges;
+                        # declaring GCPRecordSet as the source would only add a redundant
+                        # cleanup, and omitting cleanup_where would add an unguarded one
+                        # that deletes the provider-owned edges the guard protects.
+                        source_label="DNSRecord",
+                        target_label=target.label,
+                        cleanup_where=target.cleanup_where,
+                    ),
+                ),
+            )
+            for match in _dns_record_target_matches(target)
+        ),
+    )
+    for target in DNS_RECORD_TARGETS
+)
+BBOT_IP_MATCHES_PUBLIC_IP = AnalysisJob(
+    name="Ontology - BbotIPAddress to PublicIP linking",
+    short_name="ontology_bbot_ip_matches_public_ip",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (bbot:BbotIPAddress) WHERE bbot.is_global = true AND bbot.ip_address IS NOT NULL WITH bbot MATCH (public_ip:PublicIP {ip_address: bbot.ip_address})",
+            effects=(
+                AddRelationship(
+                    "bbot",
+                    "MATCHES_PUBLIC_IP",
+                    "public_ip",
+                    source_label="BbotIPAddress",
+                    target_label="PublicIP",
+                ),
+            ),
+        ),
+    ),
+)
+# Address records resolve to IPs rather than hostnames, so DNS_RECORD_TARGETS cannot
+# reach them. Route53 joins a multi-value record into one comma-separated value;
+# GCPRecordSet keeps the list in `data`.
+_ADDRESS_RECORD_TYPES = "['A', 'AAAA']"
+DNS_RECORD_TO_PUBLIC_IP = AnalysisJob(
+    name="Ontology - DNSRecord to PublicIP linking",
+    short_name="ontology_dnsrecords_publicip",
+    cleanup_iterationsize=1000,
+    statements=tuple(
+        AnalysisStatement(
+            match=match,
+            effects=(
+                AddRelationship(
+                    "dns",
+                    "DNS_POINTS_TO",
+                    "public_ip",
+                    source_label="DNSRecord",
+                    target_label="PublicIP",
+                ),
+            ),
+        )
+        for match in (
+            f"MATCH (dns:DNSRecord) WHERE dns._ont_value IS NOT NULL AND toUpper(dns._ont_type) IN {_ADDRESS_RECORD_TYPES} AND NOT dns:GCPRecordSet UNWIND split(toString(dns._ont_value), ',') AS value WITH dns, toLower(trim(value)) AS ip WHERE ip <> '' MATCH (public_ip:PublicIP {{id: ip}})",
+            f"MATCH (dns:GCPRecordSet) WHERE dns.data IS NOT NULL AND toUpper(dns._ont_type) IN {_ADDRESS_RECORD_TYPES} UNWIND dns.data AS value WITH dns, toLower(trim(value)) AS ip MATCH (public_ip:PublicIP {{id: ip}})",
+        )
+    ),
+)
+PACKAGE_DEPLOYED_IMAGE_JOBS = (
+    AnalysisJob(
+        name="Ontology - Trivy PackageVersion DEPLOYED Image linking",
+        short_name="ontology_packages_trivy_deployed",
+        statements=(
+            AnalysisStatement(
+                match="MATCH (p:PackageVersion)-[:DETECTED_AS]->(tp:TrivyPackage)-[:DEPLOYED]->(img:Image)",
+                effects=(
+                    AddRelationship(
+                        "p",
+                        "DEPLOYED",
+                        "img",
+                        source_label="PackageVersion",
+                        target_label="Image",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    AnalysisJob(
+        name="Ontology - Syft PackageVersion DEPLOYED Image linking",
+        short_name="ontology_packages_syft_deployed",
+        statements=(
+            AnalysisStatement(
+                match="MATCH (p:PackageVersion)-[:DETECTED_AS]->(sp:SyftPackage)-[:DEPLOYED]->(img:Image)",
+                effects=(
+                    AddRelationship(
+                        "p",
+                        "DEPLOYED",
+                        "img",
+                        source_label="PackageVersion",
+                        target_label="Image",
+                    ),
+                ),
+            ),
+        ),
+    ),
+)
+PACKAGE_DEPLOYED_FILESYSTEM_SNAPSHOT = AnalysisJob(
+    name="Ontology - Trivy PackageVersion DEPLOYED FilesystemSnapshot linking",
+    short_name="ontology_packages_trivy_deployed_filesystem_snapshot",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (p:PackageVersion)-[:DETECTED_AS]->(tp:TrivyPackage)-[:DEPLOYED]->(snapshot:FilesystemSnapshot)",
+            effects=(
+                AddRelationship(
+                    "p",
+                    "DEPLOYED",
+                    "snapshot",
+                    source_label="PackageVersion",
+                    target_label="FilesystemSnapshot",
+                ),
+            ),
+        ),
+    ),
+)
+PACKAGE_AFFECTS_LINKING = AnalysisJob(
+    name="Ontology - TrivyImageFinding AFFECTS PackageVersion linking",
+    short_name="ontology_packages_affects",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (f:TrivyImageFinding)-[:AFFECTS]->(tp:TrivyPackage)<-[:DETECTED_AS]-(p:PackageVersion)",
+            effects=(
+                AddRelationship(
+                    "f",
+                    "AFFECTS",
+                    "p",
+                    source_label="TrivyImageFinding",
+                    target_label="PackageVersion",
+                ),
+            ),
+        ),
+    ),
+)
+PACKAGE_AFFECTS_SEMGREP_SCA_LINKING = AnalysisJob(
+    name="Ontology - SemgrepSCAFinding AFFECTS PackageVersion linking",
+    short_name="ontology_packages_semgrep_sca_affects",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (f:SemgrepSCAFinding)-[:AFFECTS]->(d:SemgrepDependency)<-[:DETECTED_AS]-(p:PackageVersion)",
+            effects=(
+                AddRelationship(
+                    "f",
+                    "AFFECTS",
+                    "p",
+                    source_label="SemgrepSCAFinding",
+                    target_label="PackageVersion",
+                ),
+            ),
+        ),
+    ),
+)
+PACKAGE_AFFECTS_ORCA_LINKING = AnalysisJob(
+    name="Ontology - OrcaVulnerabilityFinding AFFECTS PackageVersion linking",
+    short_name="ontology_packages_orca_affects",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (f:OrcaVulnerabilityFinding)-[:AFFECTS]->(:OrcaPackage)<-[:DETECTED_AS]-(p:PackageVersion)",
+            effects=(
+                AddRelationship(
+                    "f",
+                    "AFFECTS",
+                    "p",
+                    source_label="OrcaVulnerabilityFinding",
+                    target_label="PackageVersion",
+                ),
+            ),
+        ),
+    ),
+)
+PACKAGE_SHOULD_UPDATE_TO_LINKING = AnalysisJob(
+    name="Ontology - PackageVersion SHOULD_UPDATE_TO TrivyFix linking",
+    short_name="ontology_packages_should_update_to",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (p:PackageVersion)-[:DETECTED_AS]->(tp:TrivyPackage)-[:SHOULD_UPDATE_TO]->(fix:TrivyFix)",
+            effects=(
+                AddRelationship(
+                    "p",
+                    "SHOULD_UPDATE_TO",
+                    "fix",
+                    source_label="PackageVersion",
+                    target_label="TrivyFix",
+                ),
+            ),
+        ),
+    ),
+)
+PACKAGE_DEPENDS_ON_LINKING = AnalysisJob(
+    name="Ontology - PackageVersion DEPENDS_ON PackageVersion linking",
+    short_name="ontology_packages_depends_on",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (p1:PackageVersion)-[:DETECTED_AS]->(sp1:SyftPackage)-[:DEPENDS_ON]->(sp2:SyftPackage)<-[:DETECTED_AS]-(p2:PackageVersion)",
+            effects=(
+                AddRelationship(
+                    "p1",
+                    "DEPENDS_ON",
+                    "p2",
+                    source_label="PackageVersion",
+                    target_label="PackageVersion",
+                ),
+            ),
+        ),
+    ),
+)
+PACKAGE_LINKING_JOBS = (
+    *PACKAGE_DEPLOYED_IMAGE_JOBS,
+    PACKAGE_DEPLOYED_FILESYSTEM_SNAPSHOT,
+    PACKAGE_AFFECTS_LINKING,
+    PACKAGE_AFFECTS_SEMGREP_SCA_LINKING,
+    PACKAGE_AFFECTS_ORCA_LINKING,
+    PACKAGE_SHOULD_UPDATE_TO_LINKING,
+    PACKAGE_DEPENDS_ON_LINKING,
+)
+PUBLIC_IP_POINTS_TO_DEVICE = AnalysisJob(
+    name="Ontology - PublicIP POINTS_TO Device linking",
+    short_name="ontology_publicips_linking",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (p:PublicIP), (host:CrowdstrikeHost)<-[:OBSERVED_AS]-(d:Device) WHERE host.external_ip = p.ip_address",
+            effects=(
+                AddRelationship(
+                    "p",
+                    "POINTS_TO",
+                    "d",
+                    source_label="PublicIP",
+                    target_label="Device",
+                ),
+            ),
+            incremental_on=("p", "host", "d"),
+        ),
+    ),
+)
+TAILSCALE_DEVICE_INSTANCE_LINKING = AnalysisJob(
+    name="Tailscale device to cloud instance linking",
+    short_name="tailscale_device_instance_linking",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            comment="Create IS_INSTANCE edges from one-to-one TailscaleDevice and cloud ComputeInstance candidates.",
+            match=(
+                "CALL { "
+                "MATCH (instance:ComputeInstance) "
+                "WHERE instance:AWSEC2Instance OR instance:GCPInstance "
+                "WITH instance, [instance.hostname, instance.instancename, instance.publicdnsname] AS raw_keys "
+                "UNWIND raw_keys AS raw_key "
+                "WITH instance, raw_key "
+                "WHERE raw_key IS NOT NULL AND trim(toString(raw_key)) <> '' "
+                "WITH instance, toLower(trim(toString(raw_key))) AS full_key "
+                "WITH instance, [full_key, split(full_key, '.')[0]] AS keys "
+                "UNWIND keys AS instance_key "
+                "WITH instance, instance_key "
+                "WHERE instance_key <> '' "
+                "MATCH (device:TailscaleDevice) "
+                "WITH instance_key, instance, device, [device.hostname, device.name] AS raw_device_keys "
+                "UNWIND raw_device_keys AS raw_device_key "
+                "WITH instance_key, instance, device, raw_device_key "
+                "WHERE raw_device_key IS NOT NULL AND trim(toString(raw_device_key)) <> '' "
+                "WITH instance_key, instance, device, toLower(trim(toString(raw_device_key))) AS full_device_key "
+                "WITH instance_key, instance, device, [full_device_key, split(full_device_key, '.')[0]] AS device_keys "
+                "UNWIND device_keys AS device_key "
+                "WITH device_key, instance_key, device, instance "
+                "WHERE device_key = instance_key "
+                "RETURN DISTINCT device, instance "
+                "UNION "
+                "MATCH (device:TailscaleDevice) "
+                "WHERE device.client_connectivity_endpoints IS NOT NULL "
+                "UNWIND device.client_connectivity_endpoints AS endpoint "
+                "WITH device, endpoint "
+                "WHERE endpoint =~ '^\\\\d+\\\\.\\\\d+\\\\.\\\\d+\\\\.\\\\d+:\\\\d+$' "
+                "WITH device, split(endpoint, ':')[0] AS ip "
+                "WHERE ip <> '' "
+                "MATCH (instance:ComputeInstance) "
+                "WHERE instance:AWSEC2Instance OR instance:GCPInstance "
+                "WITH device, ip, instance, [instance.publicipaddress, instance.privateipaddress, instance.public_ip, instance.private_ip] AS raw_ips "
+                "UNWIND raw_ips AS raw_ip "
+                "WITH device, instance, ip, raw_ip "
+                "WHERE raw_ip IS NOT NULL AND trim(toString(raw_ip)) = ip "
+                "RETURN DISTINCT device, instance "
+                "} "
+                "WITH device, collect(DISTINCT instance) AS candidate_instances "
+                "WHERE size(candidate_instances) = 1 "
+                "WITH device, candidate_instances[0] AS instance "
+                "WITH instance, collect(DISTINCT device) AS candidate_devices "
+                "WHERE size(candidate_devices) = 1 "
+                "WITH candidate_devices[0] AS device, instance"
+            ),
+            effects=(
+                AddRelationship(
+                    "device",
+                    "IS_INSTANCE",
+                    "instance",
+                    source_label="TailscaleDevice",
+                    target_label="ComputeInstance",
+                ),
+            ),
+        ),
+    ),
+)
+USER_HAS_AWS_SSO_ACCOUNT = AnalysisJob(
+    name="Ontology - AWSSSOUser HAS_ACCOUNT User linking",
+    short_name="ontology_users_aws_sso",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (sso:AWSSSOUser) MATCH (u:User)-[:HAS_ACCOUNT]->(:UserAccount {id: sso.external_id})",
+            effects=(
+                AddRelationship(
+                    "u",
+                    "HAS_ACCOUNT",
+                    "sso",
+                    source_label="User",
+                    target_label="AWSSSOUser",
+                ),
+            ),
+        ),
+    ),
+)
+USER_HAS_GITHUB_ACCOUNT = AnalysisJob(
+    name="Ontology - GitHubUser HAS_ACCOUNT User linking",
+    short_name="ontology_users_github",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (u:User) WHERE u.email is not NULL MATCH (g:GitHubUser) WHERE u.email in g.organization_verified_domain_emails",
+            effects=(
+                AddRelationship(
+                    "u",
+                    "HAS_ACCOUNT",
+                    "g",
+                    source_label="User",
+                    target_label="GitHubUser",
+                ),
+            ),
+        ),
+        AnalysisStatement(
+            match=(
+                "MATCH (g:GitHubUser)-[:MEMBER_OF]->(org:GitHubOrganization)"
+                "-[:RESOURCE]->(identity:GitHubExternalIdentity)<-[:HAS_IDENTITY]-(g) "
+                "MATCH (u:User {normalized_email: identity.saml_name_id_normalized}) "
+                "WHERE u.normalized_email CONTAINS '@' "
+                "WITH g, collect(DISTINCT u) AS candidates "
+                "WHERE size(candidates) = 1 "
+                "WITH g, candidates[0] AS u "
+                "WHERE g.normalized_emails IS NOT NULL "
+                "AND NOT EXISTS { "
+                "UNWIND g.normalized_emails AS email "
+                "MATCH (other:User {normalized_email: email}) "
+                "WHERE other <> u }"
+            ),
+            effects=(
+                AddRelationship(
+                    "u",
+                    "HAS_ACCOUNT",
+                    "g",
+                    source_label="User",
+                    target_label="GitHubUser",
+                ),
+            ),
+        ),
+    ),
+)
+USER_OWNS_API_KEY = AnalysisJob(
+    name="Ontology - User OWNS APIKey linking",
+    short_name="ontology_users_api_key",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:UserAccount)<-[:OWNED_BY]-(k:APIKey)",
+            effects=(
+                AddRelationship(
+                    "u", "OWNS", "k", source_label="User", target_label="APIKey"
+                ),
+            ),
+        ),
+    ),
+)
+USER_AUTHORIZED_THIRD_PARTY_APP = AnalysisJob(
+    name="Ontology - User AUTHORIZED ThirdPartyApp linking",
+    short_name="ontology_users_third_party_app",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:UserAccount)-[authr:AUTHORIZED|APPLICATION]->(a:ThirdPartyApp)",
+            effects=(
+                AddRelationship(
+                    "u",
+                    "AUTHORIZED",
+                    "a",
+                    properties={"scopes": RawCypher("coalesce(authr.scopes, [])")},
+                    source_label="User",
+                    target_label="ThirdPartyApp",
+                ),
+            ),
+        ),
+        AnalysisStatement(
+            match="MATCH (u:User)-[:HAS_ACCOUNT]->(:OktaUser)-[:MEMBER_OF]->(:OktaGroup)-[:APPLICATION]->(a:ThirdPartyApp)",
+            effects=(
+                AddRelationship(
+                    "u",
+                    "AUTHORIZED",
+                    "a",
+                    source_label="User",
+                    target_label="ThirdPartyApp",
+                ),
+            ),
+        ),
+    ),
+)
+USER_LINKING_JOBS = (
+    USER_HAS_AWS_SSO_ACCOUNT,
+    USER_HAS_GITHUB_ACCOUNT,
+    USER_OWNS_API_KEY,
+    USER_AUTHORIZED_THIRD_PARTY_APP,
+)
+CONTAINER_RESOLVED_IMAGE = AnalysisJob(
+    name="Container RESOLVED_IMAGE analysis",
+    short_name="resolved_image_analysis_container",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            match="MATCH (c:Container)-[:HAS_IMAGE]->(i:Image) WHERE NOT i:ImageManifestList",
+            effects=(
+                AddRelationship(
+                    "c",
+                    "RESOLVED_IMAGE",
+                    "i",
+                    source_label="Container",
+                    target_label="Image",
+                ),
+            ),
+        ),
+        AnalysisStatement(
+            match="MATCH (c:Container)-[:HAS_IMAGE]->(:ImageManifestList)-[:CONTAINS_IMAGE]->(i:Image) WHERE c.architecture_normalized IS NOT NULL AND i._ont_architecture = c.architecture_normalized WITH c, collect(DISTINCT i) AS candidates WHERE size(candidates) = 1 WITH c, candidates[0] AS img",
+            effects=(
+                AddRelationship(
+                    "c",
+                    "RESOLVED_IMAGE",
+                    "img",
+                    source_label="Container",
+                    target_label="Image",
+                ),
+            ),
+        ),
+    ),
+)
+FUNCTION_RESOLVED_IMAGE = AnalysisJob(
+    name="Function RESOLVED_IMAGE analysis",
+    short_name="resolved_image_analysis_function",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            match="MATCH (f:Function)-[:HAS_IMAGE]->(i:Image) WHERE NOT i:ImageManifestList",
+            effects=(
+                AddRelationship(
+                    "f",
+                    "RESOLVED_IMAGE",
+                    "i",
+                    source_label="Function",
+                    target_label="Image",
+                ),
+            ),
+        ),
+        AnalysisStatement(
+            match="MATCH (f:Function)-[:HAS_IMAGE]->(:ImageManifestList)-[:CONTAINS_IMAGE]->(i:Image) WHERE f.architecture_normalized IS NOT NULL AND i._ont_architecture = f.architecture_normalized WITH f, collect(DISTINCT i) AS candidates WHERE size(candidates) = 1 WITH f, candidates[0] AS img",
+            effects=(
+                AddRelationship(
+                    "f",
+                    "RESOLVED_IMAGE",
+                    "img",
+                    source_label="Function",
+                    target_label="Image",
+                ),
+            ),
+        ),
+    ),
+)
+RESOLVED_IMAGE_JOBS = (CONTAINER_RESOLVED_IMAGE, FUNCTION_RESOLVED_IMAGE)
+WORKLOAD_HAS_RUNTIME_IMAGE = AnalysisJob(
+    name="Workload HAS_RUNTIME_IMAGE inventory analysis",
+    short_name="workload_has_runtime_image_analysis",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            comment=(
+                "Materialize the runtime image inventory of each ComputeService "
+                "workload, deduped per (workload, image), with workload-level internet "
+                "exposure denormalized onto the edge. Anchoring on ComputeService means "
+                "this covers workloads that run containers: ECS services, Cloud Run "
+                "services/jobs, Kubernetes controllers, and Scaleway serverless "
+                "containers. Standalone runtimes with no ComputeService controller "
+                "(bare pods, and functions such as AWS Lambda / GCP Cloud Functions / "
+                "Azure Function Apps / Scaleway serverless functions, which carry only "
+                ":Function) are intentionally NOT materialized here; they are per-instance "
+                "and low cardinality, and stay on the read-side live-collapse path. The "
+                "rt:Function branch therefore matches nothing today and exists only to "
+                "cover a future serverless function that is itself modeled as a "
+                "ComputeService (the symmetric case of Scaleway serverless containers). "
+                "The *0..6 lower bound of 0 covers serverless workloads "
+                "(e.g. ScalewayServerlessContainer) that carry both :ComputeService and "
+                ":Container on a single node with no intermediate WORKLOAD_PARENT hop. "
+                "Exposure is the OR of the service-level signal (svc.exposed_internet, "
+                "where GCP writes Cloud Run ingress exposure) and any running replica's "
+                "signal (rt.exposed_internet, where AWS ECS / Kubernetes write it). "
+                "The active-state filter accepts both 'running' (AWS ECS RUNNING, "
+                "Kubernetes running, Azure Running, GCP Cloud Run) and 'ready' (Scaleway "
+                "serverless ContainerStatus.READY) because _ont_state carries the raw "
+                "per-provider status string and providers use different words for a "
+                "container that is actively serving."
+            ),
+            match="""
+            MATCH (svc:ComputeService)<-[:WORKLOAD_PARENT*0..6]-(rt)-[:RESOLVED_IMAGE]->(img:Image)
+            WHERE (rt:Container OR rt:Function)
+              AND (NOT rt:Container OR toLower(rt._ont_state) IN ['running', 'ready'])
+            WITH svc, img, collect(coalesce(rt.exposed_internet, false)) AS rt_flags
+            WITH svc, img, (coalesce(svc.exposed_internet, false) OR true IN rt_flags) AS exposed
+            """,
+            effects=(
+                AddRelationship(
+                    "svc",
+                    "HAS_RUNTIME_IMAGE",
+                    "img",
+                    source_label="ComputeService",
+                    target_label="Image",
+                    properties={"exposed_internet": Var("exposed")},
+                ),
+            ),
+        ),
+    ),
+)
+SUPPLY_CHAIN_SOURCE_FILE = AnalysisJob(
+    name="Enrich PACKAGED_FROM with source_file from Image provenance",
+    short_name="supply_chain_source_file",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (i:Image)-[r:PACKAGED_FROM]->() WHERE r.dockerfile_path IS NULL AND i.source_file IS NOT NULL",
+            effects=(
+                SetRelationshipPropertyIfMissing(
+                    "r",
+                    "dockerfile_path",
+                    Var("i.source_file"),
+                    source_label="Image",
+                    rel_label="PACKAGED_FROM",
+                ),
+            ),
+        ),
+    ),
+)
+
+
+# Image PACKAGED_FROM repository via CodeBuild fills gaps only: an image already tied to a
+# repository by provenance (including CodeBuild variables passed as image labels),
+# Dockerfile analysis or another matcher keeps that edge. A tag can point at a manifest
+# list, which is labeled ImageManifestList rather than Image, so its platform images
+# inherit the list's match through CONTAINS_IMAGE.
+_CODEBUILD_GAPS_ONLY = (
+    "NONE(other IN [(img)-[o:PACKAGED_FROM]->() | o] "
+    "WHERE NOT coalesce(other.match_method, '') STARTS WITH 'codebuild_')"
+)
+CODEBUILD_PROJECT_NAME_CONFIDENCE = 0.4
+
+
+def _codebuild_packaged_from(
+    target_label: str, properties: dict[str, CypherValue]
+) -> AddRelationship:
+    return AddRelationship(
+        "img",
+        "PACKAGED_FROM",
+        "repo",
+        source_label="Image",
+        target_label=target_label,
+        properties=properties,
+        cleanup_where="r.match_method STARTS WITH 'codebuild_'",
+    )
+
+
+def _codebuild_build_statement(
+    provider: str,
+    target_label: str,
+    target_key: str,
+) -> AnalysisStatement:
+    # All CodeBuild PACKAGED_BY edges of one image (one per account that holds the digest)
+    # must agree on the repository before the provider is chosen.
+    return AnalysisStatement(
+        comment=f"Derive Image PACKAGED_FROM {target_label} from the CodeBuild build that pushed it.",
+        match=(
+            "MATCH (img:Image)<-[:CONTAINS_IMAGE*0..1]-()"
+            "-[pb:PACKAGED_BY]->(:AWSCodeBuildProject) "
+            f"WHERE pb.source_uri IS NOT NULL AND {_CODEBUILD_GAPS_ONLY} "
+            "WITH img, collect(pb) AS pbs "
+            "WHERE all(p IN pbs WHERE p.source_uri = pbs[0].source_uri) "
+            "WITH img, pbs[0] AS pb "
+            f"WHERE pb.source_provider = '{provider}' "
+            f"MATCH (repo:{target_label} {{{target_key}: pb.source_uri}})"
+        ),
+        effects=(
+            _codebuild_packaged_from(
+                target_label,
+                {
+                    "match_method": Var("pb.match_method"),
+                    "confidence": Var("pb.confidence"),
+                    "source_revision": Var("pb.source_revision"),
+                },
+            ),
+        ),
+    )
+
+
+def _codebuild_project_name_statement(
+    provider: str,
+    target_label: str,
+    target_key: str,
+) -> AnalysisStatement:
+    # Needs no build history: the convention that a project pushes to the ECR
+    # repository of the same name, in the same account and region, names the source.
+    return AnalysisStatement(
+        comment=f"Derive Image PACKAGED_FROM {target_label} from the same-named CodeBuild project.",
+        match=(
+            "MATCH (account:AWSAccount)-[:RESOURCE]->(ecr_repo:AWSECRRepository)"
+            "-[:REPO_IMAGE]->(:AWSECRRepositoryImage)-[:IMAGE]->(tagged) "
+            "MATCH (account)-[:RESOURCE]->(project:AWSCodeBuildProject {name: ecr_repo.name}) "
+            "WHERE project.region = ecr_repo.region AND project.source_repo_url IS NOT NULL "
+            "MATCH (img:Image)<-[:CONTAINS_IMAGE*0..1]-(tagged) "
+            "WHERE NOT exists((img)<-[:CONTAINS_IMAGE*0..1]-()-[:PACKAGED_BY]->(:AWSCodeBuildProject)) "
+            f"AND {_CODEBUILD_GAPS_ONLY} "
+            "WITH img, collect(DISTINCT [project.source_repo_url, project.source_provider]) AS sources "
+            "WHERE size(sources) = 1 "
+            "WITH img, sources[0][0] AS source_uri, sources[0][1] AS source_provider "
+            f"WHERE source_provider = '{provider}' "
+            f"MATCH (repo:{target_label} {{{target_key}: source_uri}})"
+        ),
+        effects=(
+            _codebuild_packaged_from(
+                target_label,
+                {
+                    "match_method": "codebuild_project_name",
+                    "confidence": CODEBUILD_PROJECT_NAME_CONFIDENCE,
+                    "source_revision": None,
+                },
+            ),
+        ),
+    )
+
+
+CODEBUILD_IMAGE_PACKAGED_FROM = AnalysisJob(
+    name="Image PACKAGED_FROM repository via AWS CodeBuild",
+    short_name="codebuild_image_packaged_from",
+    statements=(
+        _codebuild_build_statement("github", "GitHubRepository", "id"),
+        _codebuild_build_statement("gitlab", "GitLabProject", "web_url"),
+        _codebuild_project_name_statement("github", "GitHubRepository", "id"),
+        _codebuild_project_name_statement("gitlab", "GitLabProject", "web_url"),
+    ),
+)

@@ -1,0 +1,304 @@
+from dataclasses import dataclass
+
+from cartography.models.core.common import PropertyRef
+from cartography.models.core.nodes import CartographyNodeProperties
+from cartography.models.core.nodes import CartographyNodeSchema
+from cartography.models.core.relationships import CartographyRelProperties
+from cartography.models.core.relationships import CartographyRelSchema
+from cartography.models.core.relationships import LinkDirection
+from cartography.models.core.relationships import make_target_node_matcher
+from cartography.models.core.relationships import OtherRelationships
+from cartography.models.core.relationships import TargetNodeMatcher
+
+
+@dataclass(frozen=True)
+class KubernetesGatewayNodeProperties(CartographyNodeProperties):
+    id: PropertyRef = PropertyRef("uid", description="UID of the Gateway.")
+    load_balancer_ips: PropertyRef = PropertyRef(
+        "load_balancer_ips",
+        description="IP addresses from the Gateway API `Gateway.status.addresses[]` entries of type `IPAddress`, not requested spec addresses. Used to match GCP forwarding rules for GKE clusters.",
+    )
+    name: PropertyRef = PropertyRef(
+        "name", extra_index=True, description="Name of the Gateway."
+    )
+    namespace: PropertyRef = PropertyRef(
+        "namespace",
+        extra_index=True,
+        description="The Kubernetes namespace where this Gateway is deployed.",
+    )
+    qualified_name: PropertyRef = PropertyRef(
+        "qualified_name",
+        extra_index=True,
+        description="`<namespace>/<name>` identifier used to match the Gateway from `HTTPRoute.spec.parentRefs`.",
+    )
+    gateway_class_name: PropertyRef = PropertyRef(
+        "gateway_class_name",
+        description="Name of the `GatewayClass` referenced by `spec.gatewayClassName`.",
+    )
+    creation_timestamp: PropertyRef = PropertyRef(
+        "creation_timestamp",
+        description="Epoch seconds of `metadata.creationTimestamp`.",
+    )
+    deletion_timestamp: PropertyRef = PropertyRef(
+        "deletion_timestamp",
+        description="Epoch seconds of `metadata.deletionTimestamp`.",
+    )
+    cluster_name: PropertyRef = PropertyRef(
+        "CLUSTER_NAME",
+        set_in_kwargs=True,
+        extra_index=True,
+        description="Name of the Kubernetes cluster where this Gateway is deployed.",
+    )
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class KubernetesGatewayToKubernetesClusterRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class KubernetesGatewayToKubernetesClusterRel(CartographyRelSchema):
+    """Links a cluster to one of its gateways."""
+
+    target_node_label: str = "KubernetesCluster"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {"id": PropertyRef("CLUSTER_ID", set_in_kwargs=True)}
+    )
+    direction: LinkDirection = LinkDirection.INWARD
+    rel_label: str = "RESOURCE"
+    properties: KubernetesGatewayToKubernetesClusterRelProperties = (
+        KubernetesGatewayToKubernetesClusterRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesGatewayToKubernetesNamespaceRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class KubernetesGatewayToKubernetesNamespaceRel(CartographyRelSchema):
+    """Links a namespace to a gateway it contains."""
+
+    target_node_label: str = "KubernetesNamespace"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "cluster_name": PropertyRef("CLUSTER_NAME", set_in_kwargs=True),
+            "name": PropertyRef("namespace"),
+        }
+    )
+    direction: LinkDirection = LinkDirection.INWARD
+    rel_label: str = "CONTAINS"
+    properties: KubernetesGatewayToKubernetesNamespaceRelProperties = (
+        KubernetesGatewayToKubernetesNamespaceRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesGatewayToHTTPRouteRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class KubernetesGatewayToHTTPRouteRel(CartographyRelSchema):
+    """Links a gateway to an HTTP route attached to it."""
+
+    target_node_label: str = "KubernetesHTTPRoute"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "cluster_name": PropertyRef("CLUSTER_NAME", set_in_kwargs=True),
+            "qualified_name": PropertyRef(
+                "attached_route_qualified_names", one_to_many=True
+            ),
+        }
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "ROUTES"
+    properties: KubernetesGatewayToHTTPRouteRelProperties = (
+        KubernetesGatewayToHTTPRouteRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesGatewayToGCPForwardingRuleRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+# (:KubernetesGateway)-[:USES_LOAD_BALANCER]->(:GCPForwardingRule)
+class KubernetesGatewayToGCPForwardingRuleRel(CartographyRelSchema):
+    """Links a Gateway to the external GCP forwarding rule that exposes it, matching public `status.addresses[].value` addresses against `GCPForwardingRule.ip_address` within the GKE cluster's project. Only created for clusters ingested with GKE metadata. Backend health and firewall reachability are not evaluated."""
+
+    target_node_label: str = "GCPForwardingRule"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "ip_address": PropertyRef("gcp_public_lb_ips", one_to_many=True),
+            "project_id": PropertyRef("gcp_project_id"),
+        }
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "USES_LOAD_BALANCER"
+    properties: KubernetesGatewayToGCPForwardingRuleRelProperties = (
+        KubernetesGatewayToGCPForwardingRuleRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+# (:KubernetesGateway)-[:USES_LOAD_BALANCER]->(:GCPForwardingRule)
+class KubernetesGatewayToGCPInternalForwardingRuleRel(CartographyRelSchema):
+    """Links a Gateway to the internal GCP forwarding rule that exposes it, matching private `status.addresses[].value` addresses against `GCPForwardingRule.ip_address` within the GKE cluster's project and VPC network, so private addresses reused in other networks do not collide."""
+
+    target_node_label: str = "GCPForwardingRule"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "ip_address": PropertyRef("gcp_private_lb_ips", one_to_many=True),
+            "project_id": PropertyRef("gcp_project_id"),
+            "network": PropertyRef("gcp_network"),
+        }
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "USES_LOAD_BALANCER"
+    properties: KubernetesGatewayToGCPForwardingRuleRelProperties = (
+        KubernetesGatewayToGCPForwardingRuleRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesGatewaySchema(CartographyNodeSchema):
+    "A Gateway API gateway that accepts traffic for attached routes."
+
+    label: str = "KubernetesGateway"
+    properties: KubernetesGatewayNodeProperties = KubernetesGatewayNodeProperties()
+    sub_resource_relationship: KubernetesGatewayToKubernetesClusterRel = (
+        KubernetesGatewayToKubernetesClusterRel()
+    )
+    other_relationships: OtherRelationships = OtherRelationships(
+        [
+            KubernetesGatewayToKubernetesNamespaceRel(),
+            KubernetesGatewayToHTTPRouteRel(),
+            KubernetesGatewayToGCPForwardingRuleRel(),
+            KubernetesGatewayToGCPInternalForwardingRuleRel(),
+        ]
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesHTTPRouteNodeProperties(CartographyNodeProperties):
+    id: PropertyRef = PropertyRef("uid", description="UID of the HTTPRoute.")
+    name: PropertyRef = PropertyRef(
+        "name", extra_index=True, description="Name of the HTTPRoute."
+    )
+    namespace: PropertyRef = PropertyRef(
+        "namespace",
+        extra_index=True,
+        description="The Kubernetes namespace where this HTTPRoute is deployed.",
+    )
+    qualified_name: PropertyRef = PropertyRef(
+        "qualified_name",
+        extra_index=True,
+        description="`<namespace>/<name>` identifier used to match this HTTPRoute from `Gateway` parents.",
+    )
+    hostnames: PropertyRef = PropertyRef(
+        "hostnames", description="List of hostnames from `spec.hostnames`."
+    )
+    creation_timestamp: PropertyRef = PropertyRef(
+        "creation_timestamp",
+        description="Epoch seconds of `metadata.creationTimestamp`.",
+    )
+    deletion_timestamp: PropertyRef = PropertyRef(
+        "deletion_timestamp",
+        description="Epoch seconds of `metadata.deletionTimestamp`.",
+    )
+    cluster_name: PropertyRef = PropertyRef(
+        "CLUSTER_NAME",
+        set_in_kwargs=True,
+        extra_index=True,
+        description="Name of the Kubernetes cluster where this HTTPRoute is deployed.",
+    )
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class KubernetesHTTPRouteToKubernetesClusterRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class KubernetesHTTPRouteToKubernetesClusterRel(CartographyRelSchema):
+    """Links a cluster to one of its HTTP routes."""
+
+    target_node_label: str = "KubernetesCluster"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {"id": PropertyRef("CLUSTER_ID", set_in_kwargs=True)}
+    )
+    direction: LinkDirection = LinkDirection.INWARD
+    rel_label: str = "RESOURCE"
+    properties: KubernetesHTTPRouteToKubernetesClusterRelProperties = (
+        KubernetesHTTPRouteToKubernetesClusterRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesHTTPRouteToKubernetesNamespaceRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class KubernetesHTTPRouteToKubernetesNamespaceRel(CartographyRelSchema):
+    """Links a namespace to a HTTP route it contains."""
+
+    target_node_label: str = "KubernetesNamespace"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "cluster_name": PropertyRef("CLUSTER_NAME", set_in_kwargs=True),
+            "name": PropertyRef("namespace"),
+        }
+    )
+    direction: LinkDirection = LinkDirection.INWARD
+    rel_label: str = "CONTAINS"
+    properties: KubernetesHTTPRouteToKubernetesNamespaceRelProperties = (
+        KubernetesHTTPRouteToKubernetesNamespaceRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesHTTPRouteToKubernetesServiceRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class KubernetesHTTPRouteToKubernetesServiceRel(CartographyRelSchema):
+    """Links an HTTP route to a service it forwards traffic to."""
+
+    target_node_label: str = "KubernetesService"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "cluster_name": PropertyRef("CLUSTER_NAME", set_in_kwargs=True),
+            "qualified_name": PropertyRef(
+                "backend_service_qualified_names", one_to_many=True
+            ),
+        }
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "TARGETS"
+    properties: KubernetesHTTPRouteToKubernetesServiceRelProperties = (
+        KubernetesHTTPRouteToKubernetesServiceRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesHTTPRouteSchema(CartographyNodeSchema):
+    "A Gateway API HTTPRoute that forwards traffic to services."
+
+    label: str = "KubernetesHTTPRoute"
+    properties: KubernetesHTTPRouteNodeProperties = KubernetesHTTPRouteNodeProperties()
+    sub_resource_relationship: KubernetesHTTPRouteToKubernetesClusterRel = (
+        KubernetesHTTPRouteToKubernetesClusterRel()
+    )
+    other_relationships: OtherRelationships = OtherRelationships(
+        [
+            KubernetesHTTPRouteToKubernetesNamespaceRel(),
+            KubernetesHTTPRouteToKubernetesServiceRel(),
+        ]
+    )

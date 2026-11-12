@@ -1,0 +1,1892 @@
+import json
+from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
+
+from cartography.intel.gcp.artifact_registry import supply_chain
+from cartography.intel.gcp.artifact_registry.supply_chain import _build_layer_dicts
+from cartography.intel.gcp.artifact_registry.supply_chain import (
+    _extract_parent_image_from_spdx_sbom,
+)
+from cartography.intel.gcp.artifact_registry.supply_chain import (
+    _extract_source_from_spdx_sbom,
+)
+from cartography.intel.gcp.artifact_registry.supply_chain import (
+    _fetch_attestation_provenance,
+)
+from cartography.intel.gcp.artifact_registry.supply_chain import (
+    _fetch_legacy_sbom_provenance,
+)
+from cartography.intel.gcp.artifact_registry.supply_chain import _process_single_image
+from cartography.intel.gcp.artifact_registry.supply_chain import _TokenManager
+from cartography.intel.supply_chain import extract_provenance_from_oci_config
+from tests.data.gcp.artifact_registry import MOCK_BUILDKIT_ATTESTATION_ARTIFACT
+from tests.data.gcp.artifact_registry import MOCK_BUILDKIT_ATTESTATION_DIGEST
+from tests.data.gcp.artifact_registry import MOCK_BUILDKIT_ATTESTATION_MANIFEST
+from tests.data.gcp.artifact_registry import MOCK_BUILDKIT_ATTESTATION_MANIFEST_URL
+from tests.data.gcp.artifact_registry import MOCK_BUILDKIT_INDEX_ARTIFACT
+from tests.data.gcp.artifact_registry import MOCK_BUILDKIT_PROVENANCE_BLOB_URL
+from tests.data.gcp.artifact_registry import MOCK_BUILDKIT_PROVENANCE_STATEMENT
+from tests.data.gcp.artifact_registry import mock_ko_spdx_sbom
+from tests.data.gcp.artifact_registry import MOCK_SINGLE_IMAGE_CONFIG
+from tests.data.gcp.artifact_registry import (
+    mock_single_image_config_with_inherited_labels,
+)
+from tests.data.gcp.artifact_registry import mock_single_image_config_without_labels
+from tests.data.gcp.artifact_registry import MOCK_SINGLE_IMAGE_MANIFEST
+from tests.data.gcp.artifact_registry import mock_spdx_parent_image_sbom
+from tests.data.gcp.artifact_registry import mock_spdx_sbom
+from tests.data.gcp.artifact_registry import MOCK_SPDX_SBOM_MANIFEST
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_DIGEST_SBOM_BLOB_URL
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_DIGEST_SBOM_MANIFEST_URL
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_IMAGE_DIGEST
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_IMAGE_REFERRERS_URL
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_IMAGE_URI
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_MISSING_SBOM_URI
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_PARENT_IMAGE_DIGEST
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_PARENT_IMAGE_URI
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_SBOM_BLOB_URL
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_SBOM_MANIFEST_URL
+from tests.data.gcp.artifact_registry import MOCK_SUPPLY_CHAIN_SBOM_URI
+
+# ---------------------------------------------------------------------------
+# OCI label provenance
+# ---------------------------------------------------------------------------
+
+
+def test_extract_provenance_from_oci_config_reads_labels():
+    config = {
+        "config": {
+            "Labels": {
+                "org.opencontainers.image.source": "https://github.com/foo/bar.git",
+                "org.opencontainers.image.revision": "deadbeef",
+            },
+        },
+    }
+
+    provenance = extract_provenance_from_oci_config(config)
+
+    assert provenance["source_uri"] == "https://github.com/foo/bar"
+    assert provenance["source_revision"] == "deadbeef"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{"config": {}}, {"config": None}, {"config": {"Labels": None}}],
+    ids=["no-labels", "null-config", "null-labels"],
+)
+def test_extract_provenance_from_oci_config_no_labels_returns_empty(config):
+    assert extract_provenance_from_oci_config(config) == {}
+
+
+# ---------------------------------------------------------------------------
+# SPDX SBOM provenance
+# ---------------------------------------------------------------------------
+
+
+def test_extract_source_from_spdx_sbom_reads_described_package_download_location():
+    provenance = _extract_source_from_spdx_sbom(
+        mock_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+    )
+
+    assert provenance == {"source_uri": "https://github.com/example/widgets"}
+
+
+def test_extract_source_from_spdx_sbom_reads_described_package_golang_purl():
+    sbom = mock_spdx_sbom(
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        packages=[
+            {
+                "name": "github.com/example/widgets",
+                "SPDXID": "SPDXRef-RootPackage",
+                "downloadLocation": "NOASSERTION",
+                "externalRefs": [
+                    {
+                        "referenceCategory": "PACKAGE-MANAGER",
+                        "referenceType": "purl",
+                        "referenceLocator": (
+                            "pkg:golang/github.com/example/widgets@v0.0.0"
+                            "?type=module"
+                        ),
+                    }
+                ],
+            }
+        ],
+    )
+
+    provenance = _extract_source_from_spdx_sbom(sbom)
+
+    assert provenance == {"source_uri": "https://github.com/example/widgets"}
+
+
+def test_extract_source_from_spdx_sbom_reads_expected_source_package():
+    provenance = _extract_source_from_spdx_sbom(
+        mock_ko_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+        subject_digest=MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        expected_source_uri="https://github.com/example/widgets",
+    )
+
+    assert provenance == {"source_uri": "https://github.com/example/widgets"}
+
+
+def test_extract_source_from_spdx_sbom_rejects_missing_expected_source_package():
+    provenance = _extract_source_from_spdx_sbom(
+        mock_ko_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+        subject_digest=MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        expected_source_uri="https://github.com/example/other",
+    )
+
+    assert provenance == {}
+
+
+def test_extract_source_from_spdx_sbom_rejects_expected_source_without_subject_match():
+    provenance = _extract_source_from_spdx_sbom(
+        mock_ko_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+        expected_source_uri="https://github.com/example/widgets",
+    )
+
+    assert provenance == {}
+
+
+def test_extract_source_from_spdx_sbom_reads_ko_dependency_when_subject_matches():
+    provenance = _extract_source_from_spdx_sbom(
+        mock_ko_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+        subject_digest=MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+    )
+
+    assert provenance == {"source_uri": "https://github.com/example/widgets"}
+
+
+def test_extract_source_from_spdx_sbom_rejects_ko_dependency_when_subject_mismatches():
+    provenance = _extract_source_from_spdx_sbom(
+        mock_ko_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+        subject_digest="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+
+    assert provenance == {}
+
+
+def test_extract_source_from_spdx_sbom_ignores_dependency_only_packages():
+    sbom = mock_spdx_sbom(
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        packages=[
+            {
+                "name": "root",
+                "SPDXID": "SPDXRef-RootPackage",
+                "downloadLocation": "NOASSERTION",
+            },
+            {
+                "name": "dependency",
+                "SPDXID": "SPDXRef-Dependency",
+                "downloadLocation": "https://github.com/example/dependency",
+            },
+        ],
+    )
+
+    provenance = _extract_source_from_spdx_sbom(sbom)
+
+    assert provenance == {}
+
+
+def test_extract_source_from_spdx_sbom_requires_one_described_repo():
+    sbom = mock_spdx_sbom(
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        document_describes=["SPDXRef-RootPackage", "SPDXRef-OtherRoot"],
+        packages=[
+            {
+                "name": "root",
+                "SPDXID": "SPDXRef-RootPackage",
+                "downloadLocation": "https://github.com/example/widgets",
+            },
+            {
+                "name": "other",
+                "SPDXID": "SPDXRef-OtherRoot",
+                "downloadLocation": "https://github.com/example/other",
+            },
+        ],
+    )
+
+    provenance = _extract_source_from_spdx_sbom(sbom)
+
+    assert provenance == {}
+
+
+def test_extract_source_from_spdx_sbom_accepts_generic_document_identity():
+    sbom = mock_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST)
+    sbom["name"] = "sbom.spdx.json"
+    sbom["documentNamespace"] = "https://example.test/sbom/generic"
+
+    provenance = _extract_source_from_spdx_sbom(sbom)
+
+    assert provenance == {"source_uri": "https://github.com/example/widgets"}
+
+
+def test_extract_parent_image_from_spdx_sbom_reads_descendant_relationship():
+    provenance = _extract_parent_image_from_spdx_sbom(
+        mock_spdx_parent_image_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+    )
+
+    assert provenance == {
+        "parent_image_uri": MOCK_SUPPLY_CHAIN_PARENT_IMAGE_URI,
+        "parent_image_digest": MOCK_SUPPLY_CHAIN_PARENT_IMAGE_DIGEST,
+    }
+
+
+def test_extract_parent_image_from_spdx_sbom_falls_back_to_variant_relationship():
+    provenance = _extract_parent_image_from_spdx_sbom(
+        mock_spdx_parent_image_sbom(
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+            relationship_type="VARIANT_OF",
+        ),
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+    )
+
+    assert provenance["parent_image_digest"] == MOCK_SUPPLY_CHAIN_PARENT_IMAGE_DIGEST
+
+
+def test_extract_parent_image_from_spdx_sbom_prefers_descendant_relationship():
+    sbom = mock_spdx_parent_image_sbom(
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        relationship_type="DESCENDANT_OF",
+    )
+    sbom["packages"].append(
+        {
+            "name": "registry.example.test/variant-parent",
+            "SPDXID": "SPDXRef-Package-variant-parent",
+            "downloadLocation": "NOASSERTION",
+            "externalRefs": [
+                {
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": (
+                        "pkg:oci/variant-parent@sha256:"
+                        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                },
+            ],
+        }
+    )
+    sbom["relationships"].append(
+        {
+            "spdxElementId": "SPDXRef-Package-subject-image",
+            "relationshipType": "VARIANT_OF",
+            "relatedSpdxElement": "SPDXRef-Package-variant-parent",
+        }
+    )
+
+    provenance = _extract_parent_image_from_spdx_sbom(
+        sbom,
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+    )
+
+    assert provenance["parent_image_digest"] == MOCK_SUPPLY_CHAIN_PARENT_IMAGE_DIGEST
+
+
+def test_extract_parent_image_from_spdx_sbom_rejects_subject_mismatch():
+    provenance = _extract_parent_image_from_spdx_sbom(
+        mock_spdx_parent_image_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    )
+
+    assert provenance == {}
+
+
+def test_extract_parent_image_from_spdx_sbom_rejects_non_image_package():
+    sbom = mock_spdx_parent_image_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST)
+    sbom["packages"][1]["externalRefs"][0][
+        "referenceLocator"
+    ] = "pkg:golang/github.com/example/base@v1.0.0"
+
+    provenance = _extract_parent_image_from_spdx_sbom(
+        sbom,
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+    )
+
+    assert provenance == {}
+
+
+def test_extract_parent_image_from_spdx_sbom_rejects_self_reference():
+    provenance = _extract_parent_image_from_spdx_sbom(
+        mock_spdx_parent_image_sbom(
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+            parent_image_digest=MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        ),
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+    )
+
+    assert provenance == {}
+
+
+def test_extract_parent_image_from_spdx_sbom_rejects_ambiguous_parents():
+    sbom = mock_spdx_parent_image_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST)
+    sbom["packages"].append(
+        {
+            "name": "registry.example.test/other-base",
+            "SPDXID": "SPDXRef-Package-other-parent",
+            "downloadLocation": "NOASSERTION",
+            "externalRefs": [
+                {
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": (
+                        "pkg:docker/other-base@sha256:"
+                        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                },
+            ],
+        }
+    )
+    sbom["relationships"].append(
+        {
+            "spdxElementId": "SPDXRef-Package-subject-image",
+            "relationshipType": "DESCENDANT_OF",
+            "relatedSpdxElement": "SPDXRef-Package-other-parent",
+        }
+    )
+
+    provenance = _extract_parent_image_from_spdx_sbom(
+        sbom,
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+    )
+
+    assert provenance == {}
+
+
+def test_extract_parent_image_from_spdx_sbom_rejects_ambiguous_descendant_even_with_variant():
+    sbom = mock_spdx_parent_image_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST)
+    sbom["packages"].extend(
+        [
+            {
+                "name": "registry.example.test/other-base",
+                "SPDXID": "SPDXRef-Package-other-parent",
+                "downloadLocation": "NOASSERTION",
+                "externalRefs": [
+                    {
+                        "referenceCategory": "PACKAGE-MANAGER",
+                        "referenceType": "purl",
+                        "referenceLocator": (
+                            "pkg:docker/other-base@sha256:"
+                            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                    },
+                ],
+            },
+            {
+                "name": "registry.example.test/variant-base",
+                "SPDXID": "SPDXRef-Package-variant-parent",
+                "downloadLocation": "NOASSERTION",
+                "externalRefs": [
+                    {
+                        "referenceCategory": "PACKAGE-MANAGER",
+                        "referenceType": "purl",
+                        "referenceLocator": (
+                            "pkg:oci/variant-base@sha256:"
+                            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                        ),
+                    },
+                ],
+            },
+        ],
+    )
+    sbom["relationships"].extend(
+        [
+            {
+                "spdxElementId": "SPDXRef-Package-subject-image",
+                "relationshipType": "DESCENDANT_OF",
+                "relatedSpdxElement": "SPDXRef-Package-other-parent",
+            },
+            {
+                "spdxElementId": "SPDXRef-Package-subject-image",
+                "relationshipType": "VARIANT_OF",
+                "relatedSpdxElement": "SPDXRef-Package-variant-parent",
+            },
+        ],
+    )
+
+    provenance = _extract_parent_image_from_spdx_sbom(
+        sbom,
+        MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+    )
+
+    assert provenance == {}
+
+
+# ---------------------------------------------------------------------------
+# Layer history alignment
+# ---------------------------------------------------------------------------
+
+
+def test_build_layer_dicts_aligns_history_skipping_empty_layers():
+    enrichments = [
+        {
+            "id": "img-1",
+            "layer_diff_ids": ["sha256:a", "sha256:b"],
+            "layer_history": [
+                {"created_by": "FROM scratch", "empty_layer": False},
+                {"created_by": "ENV X=1", "empty_layer": True},
+                {"created_by": "RUN apt-get install foo", "empty_layer": False},
+            ],
+        },
+    ]
+
+    layers = {layer["diff_id"]: layer for layer in _build_layer_dicts(enrichments)}
+
+    assert layers["sha256:a"]["history"] == "FROM scratch"
+    assert layers["sha256:b"]["history"] == "RUN apt-get install foo"
+    assert layers["sha256:a"]["next_diff_ids"] == ["sha256:b"]
+    assert layers["sha256:b"]["next_diff_ids"] == []
+
+
+def test_build_layer_dicts_keeps_all_shared_layer_successors():
+    # Arrange
+    enrichments = [
+        {"layer_diff_ids": ["sha256:a", "sha256:b"]},
+        {"layer_diff_ids": ["sha256:a", "sha256:c"]},
+    ]
+
+    # Act
+    layers = {layer["diff_id"]: layer for layer in _build_layer_dicts(enrichments)}
+
+    # Assert
+    assert layers["sha256:a"]["next_diff_ids"] == ["sha256:b", "sha256:c"]
+
+
+def test_build_layer_dicts_creates_layer_when_history_truncated():
+    enrichments = [
+        {
+            "id": "img-1",
+            "layer_diff_ids": ["sha256:a", "sha256:b"],
+            "layer_history": [
+                {"created_by": "FROM scratch", "empty_layer": False},
+            ],
+        },
+    ]
+
+    layers = {layer["diff_id"]: layer for layer in _build_layer_dicts(enrichments)}
+
+    assert set(layers.keys()) == {"sha256:a", "sha256:b"}
+    assert layers["sha256:b"]["history"] is None
+
+
+def test_build_layer_dicts_prefers_populated_history_on_collision():
+    enrichments = [
+        {
+            "id": "img-no-history",
+            "layer_diff_ids": ["sha256:a"],
+            "layer_history": [],
+        },
+        {
+            "id": "img-with-history",
+            "layer_diff_ids": ["sha256:a"],
+            "layer_history": [
+                {"created_by": "RUN apt-get install foo", "empty_layer": False},
+            ],
+        },
+    ]
+
+    layers = _build_layer_dicts(enrichments)
+
+    assert len(layers) == 1
+    assert layers[0]["history"] == "RUN apt-get install foo"
+
+
+def test_build_layer_dicts_keeps_first_populated_history_on_collision():
+    enrichments = [
+        {
+            "id": "img-1",
+            "layer_diff_ids": ["sha256:a"],
+            "layer_history": [
+                {"created_by": "RUN first", "empty_layer": False},
+            ],
+        },
+        {
+            "id": "img-2",
+            "layer_diff_ids": ["sha256:a"],
+            "layer_history": [
+                {"created_by": "RUN second", "empty_layer": False},
+            ],
+        },
+    ]
+
+    layers = _build_layer_dicts(enrichments)
+
+    assert layers[0]["history"] == "RUN first"
+
+
+# ---------------------------------------------------------------------------
+# Cleanup gating in sync()
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def patched_sync(monkeypatch):
+    """Patch async fetch + neo4j writes; spy on cleanup invocations."""
+    cleanup_runs = []
+
+    fake_job = MagicMock()
+    fake_job.run = MagicMock(side_effect=lambda session: cleanup_runs.append(session))
+
+    monkeypatch.setattr(
+        supply_chain.GraphJob,
+        "from_node_schema",
+        MagicMock(return_value=fake_job),
+    )
+    monkeypatch.setattr(
+        supply_chain.GraphJob,
+        "from_matchlink",
+        MagicMock(return_value=fake_job),
+    )
+    monkeypatch.setattr(
+        supply_chain,
+        "run_scoped_analysis_job",
+        MagicMock(side_effect=lambda name, session, params: cleanup_runs.append(name)),
+    )
+    monkeypatch.setattr(
+        supply_chain,
+        "load_image_provenance",
+        MagicMock(side_effect=lambda _session, updates, _project, _tag: updates),
+    )
+    monkeypatch.setattr(supply_chain, "load_image_layers", MagicMock())
+    monkeypatch.setattr(supply_chain, "load_image_layer_relationships", MagicMock())
+    monkeypatch.setattr(
+        supply_chain,
+        "get_complete_layer_digests",
+        MagicMock(return_value=set()),
+    )
+    monkeypatch.setattr(supply_chain, "refresh_layer_closures", MagicMock())
+
+    def _set_enrichments(enrichments, fetch_failures=0):
+        async def _fake_fetch(*_args, **_kwargs):
+            return enrichments, fetch_failures
+
+        monkeypatch.setattr(supply_chain, "_fetch_all_image_provenance", _fake_fetch)
+
+    return _set_enrichments, cleanup_runs
+
+
+def test_sync_loads_provenance_and_layers_with_split_phases(patched_sync):
+    set_enrichments, _cleanup_runs = patched_sync
+    enrichments = [
+        {
+            "digest": "sha256:img-1",
+            "type": "image",
+            "media_type": "application/vnd.oci.image.manifest.v1+json",
+            "source_uri": "https://github.com/foo/bar",
+            "source_revision": "deadbeef",
+            "source_file": "Dockerfile",
+            "layer_diff_ids": ["sha256:a", "sha256:b"],
+            "layer_history": [
+                {"created_by": "FROM scratch", "empty_layer": False},
+                {"created_by": "RUN build", "empty_layer": False},
+            ],
+        },
+        {
+            "digest": "sha256:img-2",
+            "type": "image",
+            "layer_diff_ids": ["sha256:a"],
+            "layer_history": [],
+        },
+    ]
+    set_enrichments(enrichments=enrichments, fetch_failures=0)
+    neo4j_session = MagicMock()
+
+    supply_chain.sync(
+        neo4j_session=neo4j_session,
+        credentials=MagicMock(),
+        docker_artifacts_raw=[{"name": "img"}],
+        project_id="proj",
+        update_tag=1,
+        common_job_parameters={},
+        cleanup_safe=True,
+    )
+
+    supply_chain.load_image_provenance.assert_called_once_with(
+        neo4j_session,
+        [
+            {
+                "digest": "sha256:img-1",
+                "type": "image",
+                "media_type": "application/vnd.oci.image.manifest.v1+json",
+                "source_uri": "https://github.com/foo/bar",
+                "source_revision": "deadbeef",
+                "source_file": "Dockerfile",
+                "parent_image_uri": None,
+                "parent_image_digest": None,
+                "layer_diff_ids": ["sha256:a", "sha256:b"],
+                "architecture": None,
+                "os": None,
+                "os_version": None,
+                "os_features": None,
+                "variant": None,
+                "provenance_from_slsa": False,
+            },
+            {
+                "digest": "sha256:img-2",
+                "type": "image",
+                "media_type": None,
+                "source_uri": None,
+                "source_revision": None,
+                "source_file": None,
+                "parent_image_uri": None,
+                "parent_image_digest": None,
+                "layer_diff_ids": ["sha256:a"],
+                "architecture": None,
+                "os": None,
+                "os_version": None,
+                "os_features": None,
+                "variant": None,
+                "provenance_from_slsa": False,
+            },
+        ],
+        "proj",
+        1,
+    )
+    supply_chain.load_image_layers.assert_called_once()
+    layer_call_args = supply_chain.load_image_layers.call_args.args
+    assert layer_call_args[0] == neo4j_session
+    assert {layer["diff_id"] for layer in layer_call_args[1]} == {
+        "sha256:a",
+        "sha256:b",
+    }
+    assert layer_call_args[2:] == ("proj", 1)
+    supply_chain.load_image_layer_relationships.assert_called_once_with(
+        neo4j_session,
+        supply_chain.load_image_provenance.call_args.args[1],
+        1,
+    )
+
+
+def test_load_image_provenance_preserves_existing_values(monkeypatch):
+    load_nodes_without_relationships = MagicMock()
+    load_matchlinks_with_progress = MagicMock()
+    monkeypatch.setattr(
+        supply_chain,
+        "load_nodes_without_relationships",
+        load_nodes_without_relationships,
+    )
+    monkeypatch.setattr(
+        supply_chain,
+        "load_matchlinks_with_progress",
+        load_matchlinks_with_progress,
+    )
+    neo4j_session = MagicMock()
+    neo4j_session.execute_read.return_value = [
+        {
+            "digest": "sha256:img-1",
+            "type": "image",
+            "media_type": "application/vnd.oci.image.manifest.v1+json",
+            "architecture": "amd64",
+            "os": "linux",
+            "os_version": None,
+            "os_features": None,
+            "variant": "v8",
+            "source_uri": "https://github.com/foo/bar",
+            "source_revision": "deadbeef",
+            "source_file": "Dockerfile",
+            "parent_image_uri": "pkg:oci/base@sha256:parent",
+            "parent_image_digest": "sha256:parent",
+            "layer_diff_ids": ["sha256:a"],
+        },
+    ]
+    updates = [
+        {
+            "digest": "sha256:img-1",
+            "type": "image",
+            "media_type": "application/vnd.oci.image.manifest.v1+json",
+            "architecture": None,
+            "os": None,
+            "os_version": None,
+            "os_features": None,
+            "variant": None,
+            "source_uri": None,
+            "source_revision": None,
+            "source_file": None,
+            "parent_image_uri": None,
+            "parent_image_digest": None,
+            "layer_diff_ids": None,
+        },
+    ]
+
+    supply_chain.load_image_provenance(neo4j_session, updates, "proj", 1)
+
+    neo4j_session.execute_read.assert_called_once()
+    load_nodes_without_relationships.assert_called_once()
+    call = load_nodes_without_relationships.call_args
+    assert call.args[0] == neo4j_session
+    assert call.args[1].__class__.__name__ == "GCPArtifactRegistryImageProvenanceSchema"
+    assert call.args[2] == [
+        {
+            "digest": "sha256:img-1",
+            "type": "image",
+            "media_type": "application/vnd.oci.image.manifest.v1+json",
+            "architecture": "amd64",
+            "os": "linux",
+            "os_version": None,
+            "os_features": None,
+            "variant": "v8",
+            "source_uri": "https://github.com/foo/bar",
+            "source_revision": "deadbeef",
+            "source_file": "Dockerfile",
+            "parent_image_uri": "pkg:oci/base@sha256:parent",
+            "parent_image_digest": "sha256:parent",
+            "layer_diff_ids": ["sha256:a"],
+        },
+    ]
+    load_matchlinks_with_progress.assert_called_once()
+    assert "provenance updates" in call.kwargs["progress_description"]
+    assert call.kwargs["lastupdated"] == 1
+    assert call.kwargs["PROJECT_ID"] == "proj"
+
+
+def test_load_image_layers_uses_node_and_matchlink_progress_loaders(monkeypatch):
+    load_nodes_without_relationships = MagicMock()
+    load_matchlinks_with_progress = MagicMock()
+    load = MagicMock()
+    monkeypatch.setattr(
+        supply_chain,
+        "load_nodes_without_relationships",
+        load_nodes_without_relationships,
+    )
+    monkeypatch.setattr(
+        supply_chain,
+        "load_matchlinks_with_progress",
+        load_matchlinks_with_progress,
+    )
+    monkeypatch.setattr(supply_chain, "load", load)
+    neo4j_session = MagicMock()
+    layers = [{"diff_id": "sha256:a", "history": "FROM scratch"}]
+
+    supply_chain.load_image_layers(neo4j_session, layers, "proj", 1)
+
+    load_nodes_without_relationships.assert_called_once()
+    node_call = load_nodes_without_relationships.call_args
+    assert node_call.args[0] == neo4j_session
+    assert node_call.args[1].__class__.__name__ == "GCPArtifactRegistryImageLayerSchema"
+    assert node_call.args[2] == layers
+    assert "image layer nodes" in node_call.kwargs["progress_description"]
+
+    load_matchlinks_with_progress.assert_called_once()
+    rel_call = load_matchlinks_with_progress.call_args
+    assert rel_call.args[0] == neo4j_session
+    assert rel_call.args[1].__class__.__name__ == (
+        "GCPArtifactRegistryProjectToImageLayerRel"
+    )
+    assert rel_call.args[2] == layers
+    assert "RESOURCE relationships" in rel_call.kwargs["progress_description"]
+    assert rel_call.kwargs["lastupdated"] == 1
+    assert rel_call.kwargs["PROJECT_ID"] == "proj"
+    assert rel_call.kwargs["_sub_resource_label"] == "GCPProject"
+    assert rel_call.kwargs["_sub_resource_id"] == "proj"
+
+
+def test_build_image_layer_relationship_dicts_skips_manifest_lists():
+    # Act
+    relationships = supply_chain._build_image_layer_relationship_dicts(
+        [
+            {
+                "digest": "sha256:image",
+                "type": "image",
+                "layer_diff_ids": ["sha256:a", "sha256:b"],
+            },
+            {
+                "digest": "sha256:index",
+                "type": "manifest_list",
+                "layer_diff_ids": ["sha256:ignored"],
+            },
+        ],
+    )
+
+    # Assert
+    assert relationships == [
+        {
+            "digest": "sha256:image",
+            "layer_diff_ids": ["sha256:a", "sha256:b"],
+            "head_layer_diff_id": "sha256:a",
+            "tail_layer_diff_id": "sha256:b",
+        },
+    ]
+
+
+def test_sync_runs_cleanup_when_safe_and_no_failures(patched_sync):
+    set_enrichments, cleanup_runs = patched_sync
+    set_enrichments(enrichments=[], fetch_failures=0)
+
+    supply_chain.sync(
+        neo4j_session=MagicMock(),
+        credentials=MagicMock(),
+        docker_artifacts_raw=[{"name": "img"}],
+        project_id="proj",
+        update_tag=1,
+        common_job_parameters={},
+        cleanup_safe=True,
+    )
+
+    assert "gcp_artifact_registry_orphan_image_layer_cleanup.json" in cleanup_runs
+    assert len(cleanup_runs) == 2
+
+
+def test_sync_skips_cleanup_when_fetch_failures(patched_sync):
+    set_enrichments, cleanup_runs = patched_sync
+    set_enrichments(enrichments=[], fetch_failures=3)
+
+    supply_chain.sync(
+        neo4j_session=MagicMock(),
+        credentials=MagicMock(),
+        docker_artifacts_raw=[{"name": "img"}],
+        project_id="proj",
+        update_tag=1,
+        common_job_parameters={},
+        cleanup_safe=True,
+    )
+
+    assert cleanup_runs == []
+
+
+def test_sync_skips_cleanup_when_discovery_unsafe(patched_sync):
+    set_enrichments, cleanup_runs = patched_sync
+    set_enrichments(
+        enrichments=[
+            {"digest": "sha256:img", "source_uri": "https://github.com/foo/bar"}
+        ],
+        fetch_failures=0,
+    )
+
+    supply_chain.sync(
+        neo4j_session=MagicMock(),
+        credentials=MagicMock(),
+        docker_artifacts_raw=[{"name": "img"}],
+        project_id="proj",
+        update_tag=1,
+        common_job_parameters={},
+        cleanup_safe=False,
+    )
+
+    assert cleanup_runs == []
+
+
+def test_sync_skips_config_fetch_for_complete_digest(patched_sync, monkeypatch):
+    # Arrange
+    digest = "sha256:" + ("a" * 64)
+    fetch = AsyncMock(return_value=([], 0))
+    supply_chain.get_complete_layer_digests.return_value = {digest}
+    monkeypatch.setattr(supply_chain, "_fetch_all_image_provenance", fetch)
+
+    # Act
+    supply_chain.sync(
+        neo4j_session=MagicMock(),
+        credentials=MagicMock(),
+        docker_artifacts_raw=[
+            {
+                "name": f"projects/p/locations/l/repositories/r/dockerImages/i@{digest}",
+                "uri": f"us-docker.pkg.dev/p/r/i@{digest}",
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            },
+        ],
+        project_id="proj",
+        update_tag=1,
+        common_job_parameters={},
+        cleanup_safe=True,
+    )
+
+    # Assert
+    assert fetch.await_args.kwargs["cached_layer_digests"] == {digest}
+    supply_chain.refresh_layer_closures.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cached_digest_rechecks_provenance_without_fetching_config(monkeypatch):
+    config_fetch = AsyncMock()
+    provenance_fetch = AsyncMock(
+        return_value={"source_uri": "https://github.com/example/repository"},
+    )
+    monkeypatch.setattr(supply_chain, "_fetch_image_config", config_fetch)
+    monkeypatch.setattr(
+        supply_chain,
+        "_fetch_attestation_provenance",
+        provenance_fetch,
+    )
+
+    result, fetch_failed = await _process_single_image(
+        MagicMock(),
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        fetch_config=False,
+    )
+
+    config_fetch.assert_not_awaited()
+    provenance_fetch.assert_awaited_once()
+    assert fetch_failed is False
+    assert result == {
+        "digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        "source_uri": "https://github.com/example/repository",
+        "provenance_from_slsa": True,
+    }
+
+
+def test_gcp_layer_graph_uses_indexed_layer_id():
+    assert supply_chain.GCP_ARTIFACT_REGISTRY_LAYER_GRAPH.layer_id_property == "id"
+
+
+# ---------------------------------------------------------------------------
+# OCI config extraction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_extracts_platform_from_oci_config():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_CONFIG,
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+    )
+
+    assert fetch_failed is False
+    assert result == {
+        "digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        "type": "image",
+        "media_type": "application/vnd.oci.image.manifest.v1+json",
+        "architecture": "arm64",
+        "os": "linux",
+        "variant": "v8",
+        "source_uri": "https://github.com/example/widgets",
+        "source_revision": "0123456789abcdef",
+        "layer_diff_ids": [
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        ],
+        "layer_history": [
+            {
+                "created_by": "COPY app /app",
+                "empty_layer": False,
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_falls_back_to_digest_specific_spdx_sbom():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=mock_single_image_config_without_labels(),
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_REFERRERS_URL: _FakeResponse(
+                200,
+                json_body={"manifests": []},
+            ),
+            MOCK_SUPPLY_CHAIN_DIGEST_SBOM_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SPDX_SBOM_MANIFEST,
+            ),
+            MOCK_SUPPLY_CHAIN_DIGEST_SBOM_BLOB_URL: _FakeResponse(
+                200,
+                json_body=mock_ko_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: [
+                {
+                    "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+                    "tags": [
+                        f"sha256-{MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX}.sbom",
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert fetch_failed is False
+    assert result["digest"] == MOCK_SUPPLY_CHAIN_IMAGE_DIGEST
+    assert result["source_uri"] == "https://github.com/example/widgets"
+    assert result["layer_diff_ids"] == [
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    ]
+    assert MOCK_SUPPLY_CHAIN_DIGEST_SBOM_MANIFEST_URL in client.calls
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_extracts_parent_from_spdx_sbom():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=mock_single_image_config_without_labels(),
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_REFERRERS_URL: _FakeResponse(
+                200,
+                json_body={"manifests": []},
+            ),
+            MOCK_SUPPLY_CHAIN_DIGEST_SBOM_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SPDX_SBOM_MANIFEST,
+            ),
+            MOCK_SUPPLY_CHAIN_DIGEST_SBOM_BLOB_URL: _FakeResponse(
+                200,
+                json_body=mock_spdx_parent_image_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: [
+                {
+                    "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+                    "tags": [
+                        f"sha256-{MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX}.sbom",
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert fetch_failed is False
+    assert result["digest"] == MOCK_SUPPLY_CHAIN_IMAGE_DIGEST
+    assert result["parent_image_uri"] == MOCK_SUPPLY_CHAIN_PARENT_IMAGE_URI
+    assert result["parent_image_digest"] == MOCK_SUPPLY_CHAIN_PARENT_IMAGE_DIGEST
+    assert "source_uri" not in result
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_returns_parent_only_spdx_provenance():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body={"config": {"Labels": {}}},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_REFERRERS_URL: _FakeResponse(
+                200,
+                json_body={"manifests": []},
+            ),
+            MOCK_SUPPLY_CHAIN_DIGEST_SBOM_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SPDX_SBOM_MANIFEST,
+            ),
+            MOCK_SUPPLY_CHAIN_DIGEST_SBOM_BLOB_URL: _FakeResponse(
+                200,
+                json_body=mock_spdx_parent_image_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: [
+                {
+                    "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+                    "tags": [
+                        f"sha256-{MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX}.sbom",
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert fetch_failed is False
+    assert result == {
+        "digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+        "type": "image",
+        "media_type": "application/vnd.oci.image.manifest.v1+json",
+        "layer_diff_ids": [],
+        "parent_image_uri": MOCK_SUPPLY_CHAIN_PARENT_IMAGE_URI,
+        "parent_image_digest": MOCK_SUPPLY_CHAIN_PARENT_IMAGE_DIGEST,
+    }
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_fetches_spdx_parent_when_config_has_source():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_CONFIG,
+            ),
+            MOCK_SUPPLY_CHAIN_DIGEST_SBOM_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SPDX_SBOM_MANIFEST,
+            ),
+            MOCK_SUPPLY_CHAIN_DIGEST_SBOM_BLOB_URL: _FakeResponse(
+                200,
+                json_body=mock_spdx_parent_image_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: [
+                {
+                    "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+                    "tags": [
+                        f"sha256-{MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX}.sbom",
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert fetch_failed is False
+    assert result["source_uri"] == "https://github.com/example/widgets"
+    assert result["parent_image_digest"] == MOCK_SUPPLY_CHAIN_PARENT_IMAGE_DIGEST
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_falls_back_to_tagged_spdx_sbom_artifact():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=mock_single_image_config_without_labels(),
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_REFERRERS_URL: _FakeResponse(
+                200,
+                json_body={"manifests": []},
+            ),
+            MOCK_SUPPLY_CHAIN_SBOM_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SPDX_SBOM_MANIFEST,
+            ),
+            MOCK_SUPPLY_CHAIN_SBOM_BLOB_URL: _FakeResponse(
+                200,
+                json_body=mock_ko_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: [
+                {
+                    "uri": MOCK_SUPPLY_CHAIN_SBOM_URI,
+                    "tags": [
+                        f"sha256-{MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX}.sbom",
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert fetch_failed is False
+    assert result["digest"] == MOCK_SUPPLY_CHAIN_IMAGE_DIGEST
+    assert result["source_uri"] == "https://github.com/example/widgets"
+    assert MOCK_SUPPLY_CHAIN_DIGEST_SBOM_MANIFEST_URL not in client.calls
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_tries_all_tagged_spdx_sbom_artifacts():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=mock_single_image_config_without_labels(),
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_REFERRERS_URL: _FakeResponse(
+                200,
+                json_body={"manifests": []},
+            ),
+            MOCK_SUPPLY_CHAIN_SBOM_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SPDX_SBOM_MANIFEST,
+            ),
+            MOCK_SUPPLY_CHAIN_SBOM_BLOB_URL: _FakeResponse(
+                200,
+                json_body=mock_ko_spdx_sbom(MOCK_SUPPLY_CHAIN_IMAGE_DIGEST),
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: [
+                {
+                    "uri": MOCK_SUPPLY_CHAIN_MISSING_SBOM_URI,
+                    "tags": [
+                        f"sha256-{MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX}.sbom",
+                    ],
+                },
+                {
+                    "uri": MOCK_SUPPLY_CHAIN_SBOM_URI,
+                    "tags": [
+                        f"sha256-{MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX}.sbom",
+                    ],
+                },
+            ]
+        },
+    )
+
+    assert fetch_failed is False
+    assert result["digest"] == MOCK_SUPPLY_CHAIN_IMAGE_DIGEST
+    assert result["source_uri"] == "https://github.com/example/widgets"
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_treats_missing_tagged_spdx_sbom_as_noop():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=mock_single_image_config_without_labels(),
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_REFERRERS_URL: _FakeResponse(
+                200,
+                json_body={"manifests": []},
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: [
+                {
+                    "uri": MOCK_SUPPLY_CHAIN_SBOM_URI,
+                    "tags": [
+                        f"sha256-{MOCK_SUPPLY_CHAIN_IMAGE_DIGEST_HEX}.sbom",
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert fetch_failed is False
+    assert result["digest"] == MOCK_SUPPLY_CHAIN_IMAGE_DIGEST
+    assert "source_uri" not in result
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_skips_manifest_list():
+    client = MagicMock()
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+        },
+    )
+
+    assert result is None
+    assert fetch_failed is False
+    client.get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Referrers / DSSE attestation discovery
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status_code, json_body=None, headers=None):
+        self.status_code = status_code
+        self._json = json_body
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"{self.status_code}",
+                request=httpx.Request("GET", "https://example.test"),
+                response=httpx.Response(self.status_code),
+            )
+
+    def json(self):
+        return self._json
+
+
+class _FakeClient:
+    def __init__(self, responses_by_url):
+        self._responses = responses_by_url
+        self.calls = []
+
+    async def get(self, url, headers=None, timeout=None):
+        self.calls.append(url)
+        if url not in self._responses:
+            return _FakeResponse(404)
+        return self._responses[url]
+
+
+def _fake_credentials(token="abc", quota_project_id=None):
+    """Build a MagicMock that mimics google-auth Credentials.apply()."""
+    creds = MagicMock()
+    creds.token = token
+    creds.quota_project_id = quota_project_id
+
+    def _apply(headers, token=None):
+        headers["Authorization"] = f"Bearer {creds.token}"
+        if creds.quota_project_id:
+            headers["x-goog-user-project"] = creds.quota_project_id
+
+    creds.apply.side_effect = _apply
+    return creds
+
+
+def _fake_token_manager():
+    return _TokenManager(_fake_credentials())
+
+
+@pytest.mark.asyncio
+async def test_fetch_legacy_sbom_provenance_returns_empty_on_404():
+    provenance = await _fetch_legacy_sbom_provenance(
+        _FakeClient({}),
+        _fake_token_manager(),
+        registry="us-docker.pkg.dev",
+        image_path="proj/repo/img",
+        image_digest="sha256:deadbeef",
+    )
+
+    assert provenance == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_attestation_provenance_returns_empty_on_404():
+    client = _FakeClient({})
+
+    provenance = await _fetch_attestation_provenance(
+        client,
+        _fake_token_manager(),
+        registry="us-docker.pkg.dev",
+        image_path="proj/repo/img",
+        image_digest="sha256:deadbeef",
+    )
+
+    assert provenance == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_attestation_provenance_decodes_dsse_envelope():
+    import base64
+
+    statement = {
+        "predicate": {
+            "buildDefinition": {
+                "externalParameters": {
+                    "source": "https://github.com/foo/bar.git",
+                },
+            },
+        },
+    }
+    payload_b64 = base64.b64encode(json.dumps(statement).encode()).decode()
+
+    referrers_url = (
+        "https://us-docker.pkg.dev/v2/proj/repo/img/referrers/sha256:deadbeef"
+    )
+    att_manifest_url = (
+        "https://us-docker.pkg.dev/v2/proj/repo/img/manifests/sha256:att1"
+    )
+    blob_url = "https://us-docker.pkg.dev/v2/proj/repo/img/blobs/sha256:layer1"
+
+    responses = {
+        referrers_url: _FakeResponse(
+            200,
+            json_body={
+                "manifests": [
+                    {
+                        "artifactType": "application/vnd.dev.sigstore.bundle.v1+json.slsa-provenance",
+                        "digest": "sha256:att1",
+                    }
+                ]
+            },
+        ),
+        att_manifest_url: _FakeResponse(
+            200,
+            json_body={
+                "layers": [
+                    {
+                        "mediaType": "application/vnd.in-toto+json",
+                        "digest": "sha256:layer1",
+                    }
+                ]
+            },
+        ),
+        blob_url: _FakeResponse(200, json_body={"payload": payload_b64}),
+    }
+    client = _FakeClient(responses)
+
+    provenance = await _fetch_attestation_provenance(
+        client,
+        _fake_token_manager(),
+        registry="us-docker.pkg.dev",
+        image_path="proj/repo/img",
+        image_digest="sha256:deadbeef",
+    )
+
+    assert provenance.get("source_uri") == "https://github.com/foo/bar"
+
+
+# ---------------------------------------------------------------------------
+# Token refresh on 401
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_json_refreshes_token_on_401():
+    creds = _fake_credentials(token="first-token")
+
+    def _refresh(_request):
+        creds.token = "second-token"
+
+    creds.refresh.side_effect = _refresh
+    manager = _TokenManager(creds)
+
+    calls = []
+
+    async def fake_get(url, headers=None, timeout=None):
+        calls.append(headers["Authorization"])
+        if len(calls) == 1:
+            return _FakeResponse(401)
+        return _FakeResponse(200, json_body={"ok": True})
+
+    client = MagicMock()
+    client.get = fake_get
+
+    result = await supply_chain._fetch_json(
+        client, "https://example.test/v2/x", manager
+    )
+
+    assert result == {"ok": True}
+    assert calls == ["Bearer first-token", "Bearer second-token"]
+    assert manager.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_json_applies_quota_project_header():
+    creds = _fake_credentials(token="t", quota_project_id="my-quota-proj")
+    manager = _TokenManager(creds)
+
+    captured: dict[str, str] = {}
+
+    async def fake_get(url, headers=None, timeout=None):
+        captured.update(headers)
+        return _FakeResponse(200, json_body={"ok": True})
+
+    client = MagicMock()
+    client.get = fake_get
+
+    await supply_chain._fetch_json(client, "https://example.test/v2/x", manager)
+
+    assert captured.get("Authorization") == "Bearer t"
+    assert captured.get("x-goog-user-project") == "my-quota-proj"
+
+
+# ---------------------------------------------------------------------------
+# BuildKit attestations embedded in image indexes
+# ---------------------------------------------------------------------------
+
+
+EXPECTED_BUILDKIT_PROVENANCE = {
+    "source_uri": "https://github.com/example-org/widgets",
+    "source_revision": "1111111111111111111111111111111111111111",
+    "source_file": "services/api/Dockerfile",
+}
+
+
+def test_embedded_attestation_refs_reads_unknown_platform_entries():
+    refs = supply_chain._embedded_attestation_refs(
+        [MOCK_BUILDKIT_INDEX_ARTIFACT],
+        skip_subject_digests=set(),
+    )
+
+    assert refs == [
+        (
+            "us-central1-docker.pkg.dev",
+            "test-project/docker-repo/widgets-api",
+            MOCK_BUILDKIT_ATTESTATION_DIGEST,
+        ),
+    ]
+
+
+def test_embedded_attestation_refs_skips_index_with_known_source_file():
+    refs = supply_chain._embedded_attestation_refs(
+        [MOCK_BUILDKIT_INDEX_ARTIFACT],
+        skip_subject_digests={MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+    )
+
+    assert refs == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_embedded_attestation_provenance_maps_to_subject_digest():
+    client = _FakeClient(
+        {
+            MOCK_BUILDKIT_ATTESTATION_MANIFEST_URL: _FakeResponse(
+                200, json_body=MOCK_BUILDKIT_ATTESTATION_MANIFEST
+            ),
+            MOCK_BUILDKIT_PROVENANCE_BLOB_URL: _FakeResponse(
+                200, json_body=MOCK_BUILDKIT_PROVENANCE_STATEMENT
+            ),
+        },
+    )
+
+    provenance = await supply_chain._fetch_embedded_attestation_provenance(
+        client,
+        _fake_token_manager(),
+        "us-central1-docker.pkg.dev",
+        "test-project/docker-repo/widgets-api",
+        MOCK_BUILDKIT_ATTESTATION_DIGEST,
+    )
+
+    assert provenance == {MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: EXPECTED_BUILDKIT_PROVENANCE}
+
+
+@pytest.mark.asyncio
+async def test_fetch_embedded_attestation_provenance_ignores_non_slsa_layers():
+    manifest = json.loads(json.dumps(MOCK_BUILDKIT_ATTESTATION_MANIFEST))
+    manifest["layers"][0]["annotations"] = {
+        "in-toto.io/predicate-type": "https://spdx.dev/Document",
+    }
+    client = _FakeClient(
+        {
+            MOCK_BUILDKIT_ATTESTATION_MANIFEST_URL: _FakeResponse(
+                200, json_body=manifest
+            ),
+        },
+    )
+
+    provenance = await supply_chain._fetch_embedded_attestation_provenance(
+        client,
+        _fake_token_manager(),
+        "us-central1-docker.pkg.dev",
+        "test-project/docker-repo/widgets-api",
+        MOCK_BUILDKIT_ATTESTATION_DIGEST,
+    )
+
+    assert provenance == {}
+    assert MOCK_BUILDKIT_PROVENANCE_BLOB_URL not in client.calls
+
+
+@pytest.mark.asyncio
+async def test_fetch_embedded_attestation_provenance_returns_empty_on_404():
+    provenance = await supply_chain._fetch_embedded_attestation_provenance(
+        _FakeClient({}),
+        _fake_token_manager(),
+        "us-central1-docker.pkg.dev",
+        "test-project/docker-repo/widgets-api",
+        MOCK_BUILDKIT_ATTESTATION_DIGEST,
+    )
+
+    assert provenance == {}
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_prefers_slsa_over_inherited_labels():
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=mock_single_image_config_with_inherited_labels(),
+            ),
+        },
+    )
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+        embedded_provenance={
+            MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: EXPECTED_BUILDKIT_PROVENANCE,
+        },
+    )
+
+    assert fetch_failed is False
+    assert result is not None
+    assert {
+        field: result.get(field)
+        for field in ("source_uri", "source_revision", "source_file")
+    } == EXPECTED_BUILDKIT_PROVENANCE
+    assert result["provenance_from_slsa"] is True
+    assert MOCK_SUPPLY_CHAIN_IMAGE_REFERRERS_URL not in client.calls
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_image_provenance_uses_embedded_attestations(monkeypatch):
+    credentials = MagicMock()
+    credentials.valid = True
+    monkeypatch.setattr(supply_chain, "_resolve_credentials", lambda _: credentials)
+    embedded_fetch = AsyncMock(
+        return_value={MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: EXPECTED_BUILDKIT_PROVENANCE},
+    )
+    monkeypatch.setattr(
+        supply_chain,
+        "_fetch_embedded_attestation_provenance",
+        embedded_fetch,
+    )
+    processed = []
+
+    async def _fake_process(_client, _token_manager, artifact, *_args, **kwargs):
+        processed.append((artifact["uri"], kwargs["embedded_provenance"]))
+        return None, False
+
+    monkeypatch.setattr(supply_chain, "_process_single_image", _fake_process)
+
+    await supply_chain._fetch_all_image_provenance(
+        None,
+        [
+            MOCK_BUILDKIT_INDEX_ARTIFACT,
+            MOCK_BUILDKIT_ATTESTATION_ARTIFACT,
+            {
+                "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+                "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            },
+        ],
+        "test-project",
+    )
+
+    embedded_fetch.assert_awaited_once()
+    assert embedded_fetch.await_args.args[2:] == (
+        "us-central1-docker.pkg.dev",
+        "test-project/docker-repo/widgets-api",
+        MOCK_BUILDKIT_ATTESTATION_DIGEST,
+    )
+    # The attestation manifest is not enriched as if it were a runnable image.
+    assert processed == [
+        (
+            MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            {MOCK_SUPPLY_CHAIN_IMAGE_DIGEST: EXPECTED_BUILDKIT_PROVENANCE},
+        ),
+    ]
+
+
+def test_load_image_provenance_slsa_replaces_label_source(monkeypatch):
+    load_nodes_without_relationships = MagicMock()
+    monkeypatch.setattr(
+        supply_chain,
+        "load_nodes_without_relationships",
+        load_nodes_without_relationships,
+    )
+    monkeypatch.setattr(supply_chain, "load_matchlinks_with_progress", MagicMock())
+    neo4j_session = MagicMock()
+    neo4j_session.execute_read.return_value = [
+        {
+            "digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+            "source_uri": "https://github.com/example-base/base-images",
+            "source_revision": "2222222222222222222222222222222222222222",
+            "source_file": None,
+        },
+    ]
+
+    supply_chain.load_image_provenance(
+        neo4j_session,
+        [
+            {
+                "digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST,
+                **EXPECTED_BUILDKIT_PROVENANCE,
+                "provenance_from_slsa": True,
+            },
+        ],
+        "proj",
+        1,
+    )
+
+    loaded = load_nodes_without_relationships.call_args.args[2]
+    assert {
+        field: loaded[0][field]
+        for field in ("source_uri", "source_revision", "source_file")
+    } == EXPECTED_BUILDKIT_PROVENANCE
+    assert "provenance_from_slsa" not in loaded[0]
+
+
+@pytest.mark.asyncio
+async def test_process_single_image_prefers_referrers_slsa_over_labels(monkeypatch):
+    client = _FakeClient(
+        {
+            MOCK_SUPPLY_CHAIN_IMAGE_MANIFEST_URL: _FakeResponse(
+                200,
+                json_body=MOCK_SINGLE_IMAGE_MANIFEST,
+                headers={"Docker-Content-Digest": MOCK_SUPPLY_CHAIN_IMAGE_DIGEST},
+            ),
+            MOCK_SUPPLY_CHAIN_IMAGE_CONFIG_URL: _FakeResponse(
+                200,
+                json_body=mock_single_image_config_with_inherited_labels(),
+            ),
+        },
+    )
+    referrers_fetch = AsyncMock(return_value=EXPECTED_BUILDKIT_PROVENANCE)
+    monkeypatch.setattr(supply_chain, "_fetch_attestation_provenance", referrers_fetch)
+
+    result, fetch_failed = await _process_single_image(
+        client,
+        _fake_token_manager(),
+        {
+            "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+            "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        },
+    )
+
+    referrers_fetch.assert_awaited_once()
+    assert fetch_failed is False
+    assert result is not None
+    assert {
+        field: result.get(field)
+        for field in ("source_uri", "source_revision", "source_file")
+    } == EXPECTED_BUILDKIT_PROVENANCE
+    assert result["provenance_from_slsa"] is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_image_provenance_counts_attestation_failures(monkeypatch):
+    credentials = MagicMock()
+    credentials.valid = True
+    monkeypatch.setattr(supply_chain, "_resolve_credentials", lambda _: credentials)
+    monkeypatch.setattr(
+        supply_chain,
+        "_fetch_embedded_attestation_provenance",
+        AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "503",
+                request=httpx.Request("GET", "https://example.test"),
+                response=httpx.Response(503),
+            ),
+        ),
+    )
+    processed = []
+
+    async def _fake_process(_client, _token_manager, artifact, *_args, **kwargs):
+        processed.append(kwargs["embedded_provenance"])
+        return None, False
+
+    monkeypatch.setattr(supply_chain, "_process_single_image", _fake_process)
+
+    _, fetch_failures = await supply_chain._fetch_all_image_provenance(
+        None,
+        [
+            MOCK_BUILDKIT_INDEX_ARTIFACT,
+            {
+                "name": MOCK_SUPPLY_CHAIN_IMAGE_ARTIFACT_NAME,
+                "uri": MOCK_SUPPLY_CHAIN_IMAGE_URI,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            },
+        ],
+        "test-project",
+    )
+
+    assert fetch_failures == 1
+    assert processed == [{}]

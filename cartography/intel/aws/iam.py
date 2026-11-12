@@ -1,96 +1,221 @@
 import enum
+import fnmatch
 import json
 import logging
+import time
+from collections import namedtuple
+from datetime import datetime
 from typing import Any
+from typing import Callable
 from typing import Dict
 from typing import List
 from typing import Tuple
 
+import backoff
 import boto3
 import neo4j
+from botocore.exceptions import ClientError
+from botocore.exceptions import ConnectTimeoutError
+from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ReadTimeoutError
 
-from cartography.intel.aws.permission_relationships import parse_statement_node
+from cartography.client.core.tx import load
+from cartography.client.core.tx import load_matchlinks
+from cartography.client.core.tx import read_list_of_dicts_tx
+from cartography.client.core.tx import read_list_of_values_tx
+from cartography.graph.job import GraphJob
+from cartography.graph.statement import GraphStatement
+from cartography.intel.aws.permission_relationships import (
+    extract_condition_context_keys,
+)
+from cartography.intel.aws.permission_relationships import parse_condition_blob
 from cartography.intel.aws.permission_relationships import principal_allowed_on_resource
-from cartography.util import run_cleanup_job
+from cartography.intel.aws.util.arns import get_account_partition
+from cartography.intel.aws.util.botocore_config import create_boto3_client
+from cartography.intel.aws.util.botocore_config import create_boto3_resource
+from cartography.models.aws.iam.access_key import AccountAccessKeySchema
+from cartography.models.aws.iam.account_role import AWSAccountAWSRoleSchema
+from cartography.models.aws.iam.account_summary import AWSAccountSummarySchema
+from cartography.models.aws.iam.federated_principal import AWSFederatedPrincipalSchema
+from cartography.models.aws.iam.group import AWSGroupSchema
+from cartography.models.aws.iam.inline_policy import AWSInlinePolicySchema
+from cartography.models.aws.iam.managed_policy import AWSManagedPolicySchema
+from cartography.models.aws.iam.mfa_device import AWSMfaDeviceSchema
+from cartography.models.aws.iam.policy_statement import AWSPolicyStatementSchema
+from cartography.models.aws.iam.principal_service_access import (
+    AWSPrincipalServiceAccessSchema,
+)
+from cartography.models.aws.iam.role import AWSRoleSchema
+from cartography.models.aws.iam.role_trust import AWSRoleTrustsPrincipalMatchLink
+from cartography.models.aws.iam.root_principal import AWSRootPrincipalSchema
+from cartography.models.aws.iam.samlprovider import AWSSAMLProviderSchema
+from cartography.models.aws.iam.server_certificate import AWSServerCertificateSchema
+from cartography.models.aws.iam.service_principal import AWSServicePrincipalSchema
+from cartography.models.aws.iam.sts_assumerole_allow import STSAssumeRoleAllowMatchLink
+from cartography.models.aws.iam.user import AWSUserSchema
+from cartography.stats import get_stats_client
+from cartography.util import aws_handle_regions
+from cartography.util import backoff_handler
+from cartography.util import merge_module_sync_metadata
 from cartography.util import timeit
+
 logger = logging.getLogger(__name__)
+stat_handler = get_stats_client(__name__)
 
 # Overview of IAM in AWS
 # https://aws.amazon.com/iam/
 
 
 class PolicyType(enum.Enum):
-    managed = 'managed'
-    inline = 'inline'
+    managed = "managed"
+    inline = "inline"
+
+
+TransformedRoleData = namedtuple(
+    "TransformedRoleData",
+    [
+        "role_data",
+        "trust_relationships",
+        "federated_principals",
+        "service_principals",
+        "external_aws_accounts",
+    ],
+)
+
+TransformedPolicyData = namedtuple(
+    "TransformedPolicyData",
+    [
+        "managed_policies",
+        "inline_policies",
+        "statements_by_policy_id",
+    ],
+)
+
+
+def get_policy_name_from_arn(arn: str) -> str:
+    return arn.split("/")[-1]
 
 
 @timeit
-def get_group_policies(boto3_session: boto3.session.Session, group_name: str) -> Dict:
-    client = boto3_session.client('iam')
-    paginator = client.get_paginator('list_group_policies')
+def get_group_policies(boto3_session: boto3.Session, group_name: str) -> Dict:
+    client = create_boto3_client(boto3_session, "iam")
+    paginator = client.get_paginator("list_group_policies")
     policy_names: List[Dict] = []
     for page in paginator.paginate(GroupName=group_name):
-        policy_names.extend(page['PolicyNames'])
-    return {'PolicyNames': policy_names}
+        policy_names.extend(page["PolicyNames"])
+    return {"PolicyNames": policy_names}
 
 
 @timeit
 def get_group_policy_info(
-        boto3_session: boto3.session.Session, group_name: str, policy_name: str,
+    boto3_session: boto3.Session,
+    group_name: str,
+    policy_name: str,
 ) -> Any:
-    client = boto3_session.client('iam')
+    client = create_boto3_client(boto3_session, "iam")
     return client.get_group_policy(GroupName=group_name, PolicyName=policy_name)
 
 
 @timeit
-def get_group_membership_data(boto3_session: boto3.session.Session, group_name: str) -> Dict:
-    client = boto3_session.client('iam')
+def get_group_membership_data(
+    boto3_session: boto3.Session,
+    group_name: str,
+) -> Dict:
+    client = create_boto3_client(boto3_session, "iam")
     try:
         memberships = client.get_group(GroupName=group_name)
         return memberships
     except client.exceptions.NoSuchEntityException:
         # Avoid crashing the sync
-        logger.warning("client.get_group(GroupName='%s') failed with NoSuchEntityException; skipping.", group_name)
+        logger.warning(
+            "client.get_group(GroupName='%s') failed with NoSuchEntityException; skipping.",
+            group_name,
+        )
         return {}
 
 
 @timeit
-def get_group_policy_data(boto3_session: boto3.session.Session, group_list: List[Dict]) -> Dict:
-    resource_client = boto3_session.resource('iam')
+@aws_handle_regions
+def get_group_policy_data(
+    boto3_session: boto3.Session,
+    group_list: List[Dict],
+) -> Dict:
+    resource_client = create_boto3_resource(boto3_session, "iam")
     policies = {}
     for group in group_list:
         name = group["GroupName"]
         arn = group["Arn"]
         resource_group = resource_client.Group(name)
-        policies[arn] = policies[arn] = {p.name: p.policy_document["Statement"] for p in resource_group.policies.all()}
+        policies[arn] = policies[arn] = {
+            p.name: p.policy_document["Statement"]
+            for p in resource_group.policies.all()
+        }
     return policies
 
 
+def _get_managed_policy_statements(
+    resource_client: Any,
+    policy_arn: str,
+    policy_statement_cache: Dict[str, Any],
+) -> Any:
+    """
+    Return the default-version statements of a managed policy, fetching each ARN once.
+
+    The same managed policy is usually attached to many principals, and resolving it
+    costs a GetPolicy plus a GetPolicyVersion call. Fetching it once per attachment
+    multiplies IAM API calls by the attachment count, which trips IAM throttling on
+    large accounts. The caller owns the cache so that a backoff retry of the whole
+    getter reuses the documents fetched before the throttle instead of starting over.
+    """
+    if policy_arn not in policy_statement_cache:
+        policy = resource_client.Policy(policy_arn)
+        policy_statement_cache[policy_arn] = policy.default_version.document[
+            "Statement"
+        ]
+    return policy_statement_cache[policy_arn]
+
+
 @timeit
-def get_group_managed_policy_data(boto3_session: boto3.session.Session, group_list: List[Dict]) -> Dict:
-    resource_client = boto3_session.resource('iam')
+@aws_handle_regions
+def get_group_managed_policy_data(
+    boto3_session: boto3.Session,
+    group_list: List[Dict],
+    policy_statement_cache: Dict[str, Any] | None = None,
+) -> Dict:
+    if policy_statement_cache is None:
+        policy_statement_cache = {}
+    resource_client = create_boto3_resource(boto3_session, "iam")
     policies = {}
     for group in group_list:
         name = group["GroupName"]
-        arn = group["Arn"]
+        group_arn = group["Arn"]
         resource_group = resource_client.Group(name)
-        policies[arn] = {
-            p.policy_name: p.default_version.document["Statement"]
+        policies[group_arn] = {
+            p.arn: _get_managed_policy_statements(
+                resource_client, p.arn, policy_statement_cache
+            )
             for p in resource_group.attached_policies.all()
         }
     return policies
 
 
 @timeit
-def get_user_policy_data(boto3_session: boto3.session.Session, user_list: List[Dict]) -> Dict:
-    resource_client = boto3_session.resource('iam')
+@aws_handle_regions
+def get_user_policy_data(
+    boto3_session: boto3.Session,
+    user_list: List[Dict],
+) -> Dict:
+    resource_client = create_boto3_resource(boto3_session, "iam")
     policies = {}
     for user in user_list:
         name = user["UserName"]
         arn = user["Arn"]
         resource_user = resource_client.User(name)
         try:
-            policies[arn] = {p.name: p.policy_document["Statement"] for p in resource_user.policies.all()}
+            policies[arn] = {
+                p.name: p.policy_document["Statement"]
+                for p in resource_user.policies.all()
+            }
         except resource_client.meta.client.exceptions.NoSuchEntityException:
             logger.warning(
                 f"Could not get policies for user {name} due to NoSuchEntityException; skipping.",
@@ -99,16 +224,25 @@ def get_user_policy_data(boto3_session: boto3.session.Session, user_list: List[D
 
 
 @timeit
-def get_user_managed_policy_data(boto3_session: boto3.session.Session, user_list: List[Dict]) -> Dict:
-    resource_client = boto3_session.resource('iam')
+@aws_handle_regions
+def get_user_managed_policy_data(
+    boto3_session: boto3.Session,
+    user_list: List[Dict],
+    policy_statement_cache: Dict[str, Any] | None = None,
+) -> Dict:
+    if policy_statement_cache is None:
+        policy_statement_cache = {}
+    resource_client = create_boto3_resource(boto3_session, "iam")
     policies = {}
     for user in user_list:
         name = user["UserName"]
-        arn = user["Arn"]
+        user_arn = user["Arn"]
         resource_user = resource_client.User(name)
         try:
-            policies[arn] = {
-                p.policy_name: p.default_version.document["Statement"]
+            policies[user_arn] = {
+                p.arn: _get_managed_policy_statements(
+                    resource_client, p.arn, policy_statement_cache
+                )
                 for p in resource_user.attached_policies.all()
             }
         except resource_client.meta.client.exceptions.NoSuchEntityException:
@@ -119,15 +253,22 @@ def get_user_managed_policy_data(boto3_session: boto3.session.Session, user_list
 
 
 @timeit
-def get_role_policy_data(boto3_session: boto3.session.Session, role_list: List[Dict]) -> Dict:
-    resource_client = boto3_session.resource('iam')
+@aws_handle_regions
+def get_role_policy_data(
+    boto3_session: boto3.Session,
+    role_list: List[Dict],
+) -> Dict:
+    resource_client = create_boto3_resource(boto3_session, "iam")
     policies = {}
     for role in role_list:
         name = role["RoleName"]
         arn = role["Arn"]
         resource_role = resource_client.Role(name)
         try:
-            policies[arn] = {p.name: p.policy_document["Statement"] for p in resource_role.policies.all()}
+            policies[arn] = {
+                p.name: p.policy_document["Statement"]
+                for p in resource_role.policies.all()
+            }
         except resource_client.meta.client.exceptions.NoSuchEntityException:
             logger.warning(
                 f"Could not get policies for role {name} due to NoSuchEntityException; skipping.",
@@ -136,16 +277,25 @@ def get_role_policy_data(boto3_session: boto3.session.Session, role_list: List[D
 
 
 @timeit
-def get_role_managed_policy_data(boto3_session: boto3.session.Session, role_list: List[Dict]) -> Dict:
-    resource_client = boto3_session.resource('iam')
+@aws_handle_regions
+def get_role_managed_policy_data(
+    boto3_session: boto3.Session,
+    role_list: List[Dict],
+    policy_statement_cache: Dict[str, Any] | None = None,
+) -> Dict:
+    if policy_statement_cache is None:
+        policy_statement_cache = {}
+    resource_client = create_boto3_resource(boto3_session, "iam")
     policies = {}
     for role in role_list:
         name = role["RoleName"]
-        arn = role["Arn"]
+        role_arn = role["Arn"]
         resource_role = resource_client.Role(name)
         try:
-            policies[arn] = {
-                p.policy_name: p.default_version.document["Statement"]
+            policies[role_arn] = {
+                p.arn: _get_managed_policy_statements(
+                    resource_client, p.arn, policy_statement_cache
+                )
                 for p in resource_role.attached_policies.all()
             }
         except resource_client.meta.client.exceptions.NoSuchEntityException:
@@ -156,39 +306,329 @@ def get_role_managed_policy_data(boto3_session: boto3.session.Session, role_list
 
 
 @timeit
-def get_user_list_data(boto3_session: boto3.session.Session) -> Dict:
-    client = boto3_session.client('iam')
+@aws_handle_regions
+def get_role_tags(boto3_session: boto3.Session) -> List[Dict]:
+    role_list = get_role_list_data(boto3_session)["Roles"]
+    resource_client = create_boto3_resource(boto3_session, "iam")
+    role_tag_data: List[Dict] = []
+    for role in role_list:
+        name = role["RoleName"]
+        role_arn = role["Arn"]
+        try:
+            resource_role = resource_client.Role(name)
+            role_tags = resource_role.tags
+        except resource_client.meta.client.exceptions.NoSuchEntityException:
+            logger.warning(
+                "resource_client.Role('%s').tags failed with NoSuchEntityException; skipping.",
+                name,
+            )
+            continue
+        if not role_tags:
+            continue
 
-    paginator = client.get_paginator('list_users')
+        tag_data = {
+            "ResourceARN": role_arn,
+            "Tags": role_tags,
+        }
+        role_tag_data.append(tag_data)
+
+    return role_tag_data
+
+
+@timeit
+@aws_handle_regions
+def get_user_tags(boto3_session: boto3.Session) -> List[Dict]:
+    user_list = get_user_list_data(boto3_session)["Users"]
+    resource_client = create_boto3_resource(boto3_session, "iam")
+    user_tag_data: List[Dict] = []
+    for user in user_list:
+        name = user["UserName"]
+        user_arn = user["Arn"]
+        try:
+            resource_user = resource_client.User(name)
+            user_tags = resource_user.tags
+        except resource_client.meta.client.exceptions.NoSuchEntityException:
+            logger.warning(
+                "resource_client.User('%s').tags failed with NoSuchEntityException; skipping.",
+                name,
+            )
+            continue
+        if not user_tags:
+            continue
+
+        tag_data = {
+            "ResourceARN": user_arn,
+            "Tags": user_tags,
+        }
+        user_tag_data.append(tag_data)
+
+    return user_tag_data
+
+
+@timeit
+def get_user_list_data(boto3_session: boto3.Session) -> Dict:
+    client = create_boto3_client(boto3_session, "iam")
+
+    paginator = client.get_paginator("list_users")
     users: List[Dict] = []
     for page in paginator.paginate():
-        users.extend(page['Users'])
-    return {'Users': users}
+        users.extend(page["Users"])
+    return {"Users": users}
 
 
 @timeit
-def get_group_list_data(boto3_session: boto3.session.Session) -> Dict:
-    client = boto3_session.client('iam')
-    paginator = client.get_paginator('list_groups')
+def get_group_list_data(boto3_session: boto3.Session) -> Dict:
+    client = create_boto3_client(boto3_session, "iam")
+    paginator = client.get_paginator("list_groups")
     groups: List[Dict] = []
     for page in paginator.paginate():
-        groups.extend(page['Groups'])
-    return {'Groups': groups}
+        groups.extend(page["Groups"])
+    return {"Groups": groups}
 
 
 @timeit
-def get_role_list_data(boto3_session: boto3.session.Session) -> Dict:
-    client = boto3_session.client('iam')
-    paginator = client.get_paginator('list_roles')
+def get_role_list_data(boto3_session: boto3.Session) -> Dict:
+    client = create_boto3_client(boto3_session, "iam")
+    paginator = client.get_paginator("list_roles")
     roles: List[Dict] = []
     for page in paginator.paginate():
-        roles.extend(page['Roles'])
-    return {'Roles': roles}
+        roles.extend(page["Roles"])
+    return {"Roles": roles}
+
+
+# Caps how many report jobs are pending at once. IAM throttles report generation
+# when an account submits many jobs back to back, and at 100 that throttle often
+# outlasted the retry budget. Twenty jobs submitted together still finish within
+# a few seconds, so reports keep building concurrently.
+_SERVICE_LAST_ACCESSED_BATCH_SIZE = 20
+
+_IAM_THROTTLING_ERROR_CODES = {
+    "Throttling",
+    "ThrottlingException",
+    "TooManyRequestsException",
+    "RequestLimitExceeded",
+}
+
+AccountAuthorizationDetails = namedtuple(
+    "AccountAuthorizationDetails",
+    [
+        "user_inline_policies",
+        "user_managed_policies",
+        "group_inline_policies",
+        "group_managed_policies",
+        "group_memberships",
+        "role_inline_policies",
+        "role_managed_policies",
+        "role_last_used",
+    ],
+)
+
+
+def _is_iam_throttling_error(error: Exception) -> bool:
+    return (
+        isinstance(error, ClientError)
+        and error.response.get("Error", {}).get("Code") in _IAM_THROTTLING_ERROR_CODES
+    )
+
+
+@backoff.on_exception(  # type: ignore[misc]
+    backoff.expo,
+    ClientError,
+    max_time=600,
+    giveup=lambda e: not _is_iam_throttling_error(e),
+    on_backoff=backoff_handler,
+)
+def _get_account_authorization_details_page(client: Any, marker: str | None) -> Dict:
+    # Retried per page so a throttle resumes from the current marker instead of
+    # restarting the whole account snapshot.
+    kwargs: Dict[str, Any] = {"MaxItems": 1000}
+    if marker:
+        kwargs["Marker"] = marker
+    return client.get_account_authorization_details(**kwargs)
+
+
+def _default_version_statements(policy: Dict) -> Any:
+    for version in policy.get("PolicyVersionList", []):
+        if version.get("IsDefaultVersion"):
+            return version["Document"]["Statement"]
+    return None
 
 
 @timeit
-def get_account_access_key_data(boto3_session: boto3.session.Session, username: str) -> Dict:
-    client = boto3_session.client('iam')
+def get_account_authorization_details(
+    boto3_session: boto3.Session,
+    policy_statement_cache: Dict[str, Any] | None = None,
+) -> AccountAuthorizationDetails | None:
+    """
+    Fetch inline policies, managed policy attachments and group memberships for every
+    principal with GetAccountAuthorizationDetails, which pages through the whole
+    account in a few calls instead of several calls per principal.
+
+    Returns None when the caller lacks iam:GetAccountAuthorizationDetails so the sync
+    can fall back to per-principal calls.
+    """
+    if policy_statement_cache is None:
+        policy_statement_cache = {}
+    client = create_boto3_client(boto3_session, "iam")
+    users: List[Dict] = []
+    groups: List[Dict] = []
+    roles: List[Dict] = []
+    marker = None
+    try:
+        while True:
+            page = _get_account_authorization_details_page(client, marker)
+            users.extend(page.get("UserDetailList", []))
+            groups.extend(page.get("GroupDetailList", []))
+            roles.extend(page.get("RoleDetailList", []))
+            # Every version of every policy is returned; keep only the default
+            # version's statements so memory tracks attached policies, not history.
+            for policy in page.get("Policies", []):
+                statements = _default_version_statements(policy)
+                if statements is not None:
+                    policy_statement_cache.setdefault(policy["Arn"], statements)
+            next_marker = page.get("Marker")
+            if not page.get("IsTruncated") or not next_marker or next_marker == marker:
+                break
+            marker = next_marker
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") in (
+            "AccessDenied",
+            "AccessDeniedException",
+        ):
+            logger.warning(
+                "Missing iam:GetAccountAuthorizationDetails; falling back to "
+                "per-principal IAM policy calls, which are slower and more likely "
+                "to be throttled on large accounts.",
+            )
+            return None
+        raise
+
+    resource_client = create_boto3_resource(boto3_session, "iam")
+
+    def managed(attached: List[Dict]) -> Dict[str, Any]:
+        # A policy missing from the snapshot (e.g. attached mid-pagination) is
+        # fetched directly through the shared cache.
+        return {
+            p["PolicyArn"]: _get_managed_policy_statements(
+                resource_client, p["PolicyArn"], policy_statement_cache
+            )
+            for p in attached
+        }
+
+    def inline(policies: List[Dict]) -> Dict[str, Any]:
+        return {p["PolicyName"]: p["PolicyDocument"]["Statement"] for p in policies}
+
+    group_arn_by_name = {g["GroupName"]: g["Arn"] for g in groups}
+    group_memberships: Dict[str, List[str]] = {g["Arn"]: [] for g in groups}
+    for user in users:
+        for group_name in user.get("GroupList", []):
+            group_arn = group_arn_by_name.get(group_name)
+            if group_arn is not None:
+                group_memberships[group_arn].append(user["Arn"])
+
+    return AccountAuthorizationDetails(
+        user_inline_policies={
+            u["Arn"]: inline(u.get("UserPolicyList", [])) for u in users
+        },
+        user_managed_policies={
+            u["Arn"]: managed(u.get("AttachedManagedPolicies", [])) for u in users
+        },
+        group_inline_policies={
+            g["Arn"]: inline(g.get("GroupPolicyList", [])) for g in groups
+        },
+        group_managed_policies={
+            g["Arn"]: managed(g.get("AttachedManagedPolicies", [])) for g in groups
+        },
+        group_memberships=group_memberships,
+        role_inline_policies={
+            r["Arn"]: inline(r.get("RolePolicyList", [])) for r in roles
+        },
+        role_managed_policies={
+            r["Arn"]: managed(r.get("AttachedManagedPolicies", [])) for r in roles
+        },
+        role_last_used={
+            r["Arn"]: r.get("RoleLastUsed", {}).get("LastUsedDate") for r in roles
+        },
+    )
+
+
+@timeit
+@aws_handle_regions
+def get_saml_providers(boto3_session: boto3.session.Session) -> list[dict[str, Any]]:
+    # Return a list (not a dict) so @aws_handle_regions' [] fallback on
+    # AccessDenied / SCP-deny matches the normal return shape.
+    client = create_boto3_client(boto3_session, "iam")
+    # list_saml_providers returns a single page
+    response = client.list_saml_providers()
+    providers = response.get("SAMLProviderList", [])
+    # Derive a friendly name from the ARN suffix
+    # (arn:aws:iam::<account>:saml-provider/<name>) since list_saml_providers
+    # does not return a name field directly.
+    for provider in providers:
+        arn = provider.get("Arn", "")
+        provider["Name"] = arn.rsplit("/", 1)[-1] if "/" in arn else arn
+    return providers
+
+
+@timeit
+def load_saml_providers(
+    neo4j_session: neo4j.Session,
+    saml_providers: list[dict[str, Any]],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    if not saml_providers:
+        return
+    load(
+        neo4j_session,
+        AWSSAMLProviderSchema(),
+        saml_providers,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
+
+
+@timeit
+@aws_handle_regions
+def get_server_certificates(boto3_session: boto3.Session) -> list[dict[str, Any]]:
+    client = create_boto3_client(boto3_session, "iam")
+    paginator = client.get_paginator("list_server_certificates")
+    certificates: list[dict[str, Any]] = []
+    for page in paginator.paginate():
+        certificates.extend(page["ServerCertificateMetadataList"])
+    return certificates
+
+
+@timeit
+def get_user_access_keys_data(
+    boto3_session: boto3.Session,
+    users: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    Get access key data for all users.
+    Returns a dict mapping user ARN to list of access key data.
+    """
+    user_access_keys = {}
+
+    for user in users:
+        username = user["name"]
+        user_arn = user["arn"]
+
+        access_keys = get_account_access_key_data(boto3_session, username)
+        if access_keys and "AccessKeyMetadata" in access_keys:
+            user_access_keys[user_arn] = access_keys["AccessKeyMetadata"]
+        else:
+            user_access_keys[user_arn] = []
+
+    return user_access_keys
+
+
+@timeit
+def get_account_access_key_data(
+    boto3_session: boto3.Session,
+    username: str,
+) -> Dict:
+    client = create_boto3_client(boto3_session, "iam")
     # NOTE we can get away without using a paginator here because users are limited to two access keys
     access_keys: Dict = {}
     try:
@@ -197,66 +637,561 @@ def get_account_access_key_data(boto3_session: boto3.session.Session, username: 
         logger.warning(
             f"Could not get access key for user {username} due to NoSuchEntityException; skipping.",
         )
+        return access_keys
+    for access_key in access_keys["AccessKeyMetadata"]:
+        access_key_id = access_key["AccessKeyId"]
+        last_used_info = client.get_access_key_last_used(
+            AccessKeyId=access_key_id,
+        )["AccessKeyLastUsed"]
+        # only LastUsedDate may be null
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/iam/client/get_access_key_last_used.html
+        access_key["LastUsedDate"] = last_used_info.get("LastUsedDate")
+        access_key["LastUsedService"] = last_used_info["ServiceName"]
+        access_key["LastUsedRegion"] = last_used_info["Region"]
     return access_keys
 
 
 @timeit
-def load_users(
-    neo4j_session: neo4j.Session, users: List[Dict], current_aws_account_id: str, aws_update_tag: int,
-) -> None:
-    ingest_user = """
-    MERGE (unode:AWSUser{arn: {ARN}})
-    ON CREATE SET unode:AWSPrincipal, unode.userid = {USERID}, unode.firstseen = timestamp(),
-    unode.createdate = {CREATE_DATE}
-    SET unode.name = {USERNAME}, unode.path = {PATH}, unode.passwordlastused = {PASSWORD_LASTUSED},
-    unode.lastupdated = {aws_update_tag}
-    WITH unode
-    MATCH (aa:AWSAccount{id: {AWS_ACCOUNT_ID}})
-    MERGE (aa)-[r:RESOURCE]->(unode)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {aws_update_tag}
+def get_group_memberships(
+    boto3_session: boto3.Session, groups: list[dict[str, Any]]
+) -> dict[str, list[str]]:
     """
-    logger.info(f"Loading {len(users)} IAM users.")
+    Get membership data for all groups.
+    Returns a dict mapping group ARN to list of user ARNs.
+    """
+    memberships = {}
+    for group in groups:
+        try:
+            membership_data = get_group_membership_data(
+                boto3_session, group["GroupName"]
+            )
+            if membership_data and "Users" in membership_data:
+                memberships[group["Arn"]] = [
+                    user["Arn"] for user in membership_data["Users"]
+                ]
+            else:
+                memberships[group["Arn"]] = []
+        except Exception:
+            logger.warning(
+                f"Could not get membership data for group {group['GroupName']}",
+                exc_info=True,
+            )
+            memberships[group["Arn"]] = []
+
+    return memberships
+
+
+@timeit
+def get_policies_for_principal(
+    neo4j_session: neo4j.Session,
+    principal_arn: str,
+) -> Dict:
+    get_policy_query = """
+    MATCH
+    (principal:AWSPrincipal{arn:$Arn})-[:POLICY]->
+    (policy:AWSPolicy)-[:STATEMENT]->
+    (statements:AWSPolicyStatement)
+    RETURN
+    DISTINCT policy.id AS policy_id,
+    COLLECT(DISTINCT statements) AS statements
+    """
+    results = neo4j_session.execute_read(
+        read_list_of_dicts_tx,
+        get_policy_query,
+        Arn=principal_arn,
+    )
+    policies = {r["policy_id"]: r["statements"] for r in results}
+    return policies
+
+
+def transform_users(users: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    user_data = []
     for user in users:
-        neo4j_session.run(
-            ingest_user,
-            ARN=user["Arn"],
-            USERID=user["UserId"],
-            CREATE_DATE=str(user["CreateDate"]),
-            USERNAME=user["UserName"],
-            PATH=user["Path"],
-            PASSWORD_LASTUSED=str(user.get("PasswordLastUsed", "")),
-            AWS_ACCOUNT_ID=current_aws_account_id,
-            aws_update_tag=aws_update_tag,
+        user_record = {
+            "arn": user["Arn"],
+            "userid": user["UserId"],
+            "name": user["UserName"],
+            "path": user["Path"],
+            "createdate": str(user["CreateDate"]),
+            "createdate_dt": user["CreateDate"],
+            "passwordlastused": str(user.get("PasswordLastUsed", "")),
+            "passwordlastused_dt": user.get("PasswordLastUsed"),
+        }
+        user_data.append(user_record)
+
+    return user_data
+
+
+def transform_groups(
+    groups: list[dict[str, Any]], group_memberships: dict[str, list[str]]
+) -> list[dict[str, Any]]:
+    group_data = []
+    for group in groups:
+        group_record = {
+            "arn": group["Arn"],
+            "groupid": group["GroupId"],
+            "name": group["GroupName"],
+            "path": group["Path"],
+            "createdate": str(group["CreateDate"]),
+            "createdate_dt": group["CreateDate"],
+            "user_arns": group_memberships.get(group["Arn"], []),
+        }
+        group_data.append(group_record)
+
+    return group_data
+
+
+def transform_access_keys(
+    user_access_keys: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    access_key_data = []
+    for user_arn, access_keys in user_access_keys.items():
+        for access_key in access_keys:
+            if access_key.get("AccessKeyId"):
+                access_key_record = {
+                    "accesskeyid": access_key["AccessKeyId"],
+                    "createdate": str(access_key["CreateDate"]),
+                    "createdate_dt": access_key["CreateDate"],
+                    "status": access_key["Status"],
+                    "lastuseddate": (
+                        str(access_key["LastUsedDate"])
+                        if access_key.get("LastUsedDate") is not None
+                        else None
+                    ),
+                    "lastuseddate_dt": access_key.get("LastUsedDate"),
+                    "lastusedservice": access_key.get("LastUsedService", ""),
+                    "lastusedregion": access_key.get("LastUsedRegion", ""),
+                    "user_arn": user_arn,  # For the sub-resource relationship
+                }
+                access_key_data.append(access_key_record)
+
+    return access_key_data
+
+
+# The sts actions that let a principal actually obtain credentials for a role. A trust
+# statement granting only e.g. sts:TagSession does not make the role assumable.
+ASSUME_ROLE_ACTIONS = frozenset(
+    {
+        "sts:assumerole",
+        "sts:assumerolewithwebidentity",
+        "sts:assumerolewithsaml",
+    }
+)
+
+# The Principal value that matches every principal. AWS treats the bare "*" and the
+# {"AWS": "*"} forms as equivalent, and does not allow wildcards inside a principal ARN.
+WILDCARD_PRINCIPAL = "*"
+
+
+def _matching_assume_role_actions(patterns: list[Any]) -> frozenset[str]:
+    """The assume-role actions matched by a list of IAM action patterns.
+
+    IAM action names are case-insensitive and may use `*` and `?` wildcards, so
+    "sts:AssumeRole*", "sts:*" and "*" all match every assume-role action.
+    """
+    lowered = [pattern.lower() for pattern in patterns if isinstance(pattern, str)]
+    return frozenset(
+        action
+        for action in ASSUME_ROLE_ACTIONS
+        if any(fnmatch.fnmatchcase(action, pattern) for pattern in lowered)
+    )
+
+
+def _account_principals(principal: str, partition: str) -> set[str]:
+    """The two ways a policy can name the account an AWS principal belongs to.
+
+    An account appears either as its bare ID or as its root ARN. The partition is only
+    used for a bare account ID, which carries none of its own.
+    """
+    if principal.isdigit():
+        account_id = principal
+    elif principal.startswith("arn:"):
+        parts = principal.split(":")
+        if len(parts) < 6 or not parts[4]:
+            return set()
+        partition, account_id = parts[1], parts[4]
+    else:
+        # e.g. the unique ID AWS leaves in a policy whose role or user was deleted.
+        return set()
+    return {account_id, f"arn:{partition}:iam::{account_id}:root"}
+
+
+def _statement_assume_role_actions(statement: dict[str, Any]) -> frozenset[str]:
+    """The assume-role actions a trust statement applies to, whether it allows or denies.
+
+    `Action` lists the actions the statement covers; `NotAction` covers every action
+    except the ones listed. Only the assume-role actions can draw a trust edge, so the
+    complement of a NotAction is computed exactly over that set rather than over the
+    whole action namespace: `"NotAction": "sts:AssumeRole"` covers the WebIdentity and
+    SAML flavours and leaves sts:AssumeRole alone, in an Allow and in a Deny alike.
+    """
+    if "NotAction" in statement:
+        excluded = _matching_assume_role_actions(
+            ensure_list(statement["NotAction"] or [])
         )
+        return ASSUME_ROLE_ACTIONS - excluded
+    return _matching_assume_role_actions(ensure_list(statement.get("Action") or []))
+
+
+def _usable_assume_role_actions(principal_type: str, principal: str) -> frozenset[str]:
+    """The assume-role action that a principal of this type can call.
+
+    sts:AssumeRole is called with existing AWS credentials, so it is the only one an
+    account, user, role or service can use. A SAML provider is the principal of
+    sts:AssumeRoleWithSAML, and an OIDC provider, built-in ones such as
+    accounts.google.com included, that of sts:AssumeRoleWithWebIdentity.
+    """
+    if principal_type == "Federated":
+        if ":saml-provider/" in principal:
+            return frozenset({"sts:assumerolewithsaml"})
+        return frozenset({"sts:assumerolewithwebidentity"})
+    # "AWS" or "Service"
+    return frozenset({"sts:assumerole"})
+
+
+# The condition key a third party passes to sts:AssumeRole to prove it is acting for the
+# customer that configured the trust, which guards a role against the confused deputy
+# problem. IAM condition keys are case-insensitive.
+EXTERNAL_ID_CONDITION_KEY = "sts:externalid"
+
+
+def _condition_requires_external_id(condition: Any) -> bool:
+    """Whether a trust statement's Condition only matches a request carrying sts:ExternalId.
+
+    IAM ANDs every operator in a Condition block, so a single operator that fails when the
+    key is absent is enough. Most operators are false on a missing key, but these are
+    true and so do not require one:
+
+    - `...IfExists` operators and `ForAllValues:` set operators, by definition.
+    - Negated operators such as `StringNotEquals` or `ArnNotLike`, unless qualified
+      with `ForAnyValue:`, which requires at least one request value.
+    - `Null` with a value of "true", which requires the key to be absent. `Null` with
+      "false" requires it to be present, whatever its value.
+
+    A Condition that cannot be parsed is not proven to require an external ID.
+    """
+    for operator_map in parse_condition_blob(condition):
+        if not isinstance(operator_map, dict):
+            continue
+        for operator, context_map in operator_map.items():
+            if not isinstance(operator, str) or not isinstance(context_map, dict):
+                continue
+            values = next(
+                (
+                    value
+                    for key, value in context_map.items()
+                    if isinstance(key, str) and key.lower() == EXTERNAL_ID_CONDITION_KEY
+                ),
+                None,
+            )
+            if values is None:
+                continue
+            if operator.startswith("ForAllValues:") or operator.endswith("IfExists"):
+                continue
+            for_any_value = operator.startswith("ForAnyValue:")
+            operator = operator.removeprefix("ForAnyValue:")
+            if operator == "Null":
+                null_values = ensure_list(values)
+                if null_values and all(
+                    str(value).lower() == "false" for value in null_values
+                ):
+                    return True
+                continue
+            if "Not" in operator and not for_any_value:
+                continue
+            return True
+    return False
+
+
+def _aggregate_trust_conditions(
+    statement_conditions: list[Any],
+    *,
+    is_aws_principal: bool,
+) -> dict[str, Any]:
+    """Fold the Condition blocks of every statement trusting one principal into edge properties.
+
+    ``statement_conditions`` holds one entry per statement that trusts the principal, in
+    document order: the statement's raw ``Condition`` value, or None if it had none.
+
+    AWS evaluates conditions at request time against a token that does not exist at sync
+    time, so a conditional trust is annotated rather than resolved. Following the
+    precedent set for permission relationships in
+    cartography.intel.aws.permission_relationships.collect_edge_conditions:
+
+    - If any statement trusts the principal with no Condition, the trust is reachable
+      unconditionally and we report has_condition=False. An unconditional path wins.
+    - Otherwise every path to the trust is gated, so we report has_condition=True with
+      the union of referenced context keys and the raw condition blobs as a JSON string.
+
+    has_external_id follows the same rule: it is True only when every statement trusting
+    the principal requires sts:ExternalId, since any other statement is a path to the role
+    that skips it. It is always False for service and federated principals.
+    """
+    unconditional = {
+        "has_condition": False,
+        "condition_keys": [],
+        "conditions": None,
+        "has_external_id": False,
+    }
+    conditional_blobs: list[Any] = []
+    condition_keys: set[str] = set()
+
+    for condition in statement_conditions:
+        if not condition:
+            # An unconditional statement trusts this principal; the edge is effectively
+            # unconditional no matter what the other statements say.
+            return unconditional
+        parsed = parse_condition_blob(condition)
+        if parsed:
+            conditional_blobs.extend(parsed)
+            condition_keys.update(extract_condition_context_keys(parsed))
+        else:
+            # Fail safe toward "conditional": if the blob cannot be parsed, keep the edge
+            # flagged and preserve the raw value rather than downgrading it to
+            # unconditional.
+            conditional_blobs.append(
+                condition if isinstance(condition, str) else str(condition)
+            )
+
+    if not conditional_blobs:
+        # Defensive: a principal with no statements at all should not reach here.
+        return unconditional
+
+    return {
+        "has_condition": True,
+        "condition_keys": sorted(condition_keys),
+        "conditions": json.dumps(conditional_blobs),
+        "has_external_id": is_aws_principal
+        and all(
+            _condition_requires_external_id(condition)
+            for condition in statement_conditions
+        ),
+    }
+
+
+def transform_role_trust_policies(
+    roles: list[dict[str, Any]], current_aws_account_id: str
+) -> TransformedRoleData:
+    """
+    Processes AWS role assumption policy documents in the list_roles response.
+    Returns a TransformedRoleData object containing the role data, the trust
+    relationships to load, federated principals, service principals, and external AWS
+    accounts.
+    """
+    role_data: list[dict[str, Any]] = []
+    trust_relationships: list[dict[str, Any]] = []
+    federated_principals: list[dict[str, Any]] = []
+    service_principals: list[dict[str, Any]] = []
+    external_aws_accounts: list[dict[str, Any]] = []
+
+    for role in roles:
+        role_arn = role["Arn"]
+
+        # Principal ARN -> one (statement index, assume-role actions, Condition) entry
+        # per Allow statement naming it, keeping only actions that principal can call.
+        # A role can trust the same principal from several statements under different
+        # conditions, so these are aggregated per (role, principal) below.
+        allowed_trusts: dict[str, list[tuple[int, frozenset[str], Any]]] = {}
+        wildcard_grants: list[tuple[int, frozenset[str], Any]] = []
+        principal_actions: dict[str, frozenset[str]] = {}
+        # Principal ARN -> the assume-role actions an unconditional Deny names for it.
+        # Deny beats Allow in IAM evaluation, so an Allow of a denied action draws no
+        # edge. The wildcard key holds the actions denied to every principal.
+        denied_actions: dict[str, set[str]] = {}
+        # The allowed principals of type AWS, i.e. IAM users, roles and accounts.
+        aws_principal_arns: set[str] = set()
+
+        for statement_index, statement in enumerate(
+            role["AssumeRolePolicyDocument"]["Statement"]
+        ):
+            actions = _statement_assume_role_actions(statement)
+            if not actions:
+                # e.g. a statement granting only sts:TagSession. It names a principal but
+                # does not let it obtain credentials for the role.
+                continue
+
+            is_deny = statement.get("Effect") == "Deny"
+            condition = statement.get("Condition")
+            principal = statement["Principal"]
+            if principal == WILDCARD_PRINCIPAL:
+                # "Principal": "*" is shorthand for {"AWS": "*"}.
+                principal = {"AWS": WILDCARD_PRINCIPAL}
+            principal_entries = _parse_principal_entries(principal)
+
+            if is_deny:
+                # An unconditional Deny settles the question for the actions it names:
+                # the principal cannot obtain the role through them, whatever the Allow
+                # statements say. A conditional Deny only applies when its condition
+                # holds at request time, which we cannot evaluate here, so it is left to
+                # the Allow statements. Either way a Deny is not evidence that the named
+                # principal or its account exists, so no nodes are created from it.
+                if not condition:
+                    for _, principal_arn in principal_entries:
+                        denied_actions.setdefault(principal_arn, set()).update(actions)
+                continue
+
+            for principal_type, principal_arn in principal_entries:
+                if principal_type == "AWS" and principal_arn == WILDCARD_PRINCIPAL:
+                    # No standalone wildcard edge, but this grant also applies to
+                    # concrete principals named elsewhere in the policy.
+                    wildcard_grants.append((statement_index, actions, condition))
+                    continue
+                if principal_type == "Federated":
+                    # Add this to list of federated nodes to create
+                    account_id = get_account_from_arn(principal_arn)
+                    federated_principals.append(
+                        {
+                            "arn": principal_arn,
+                            "type": "Federated",
+                            "other_account_id": (
+                                account_id
+                                if account_id != current_aws_account_id
+                                else None
+                            ),
+                            "role_arn": role_arn,
+                        }
+                    )
+                elif principal_type == "Service":
+                    # Add to the list of service nodes to create
+                    service_principals.append(
+                        {
+                            "arn": principal_arn,
+                            "type": "Service",
+                        }
+                    )
+                    # Service principals are global so there is no account id.
+                elif principal_type == "AWS":
+                    aws_principal_arns.add(principal_arn)
+                    if "root" in principal_arn:
+                        # The current principal trusts a root principal.
+
+                        # First check if the root principal is in a different account than the current one.
+                        # Add what we know about that account to the graph.
+                        account_id = get_account_from_arn(principal_arn)
+                        if account_id != current_aws_account_id:
+                            external_aws_accounts.append(
+                                {
+                                    "id": account_id,
+                                    "partition": principal_arn.split(":")[1],
+                                }
+                            )
+                else:
+                    # This should not happen but who knows.
+                    logger.warning(f"Unknown principal type: {principal_type}")
+                    continue
+
+                principal_actions[principal_arn] = _usable_assume_role_actions(
+                    principal_type, principal_arn
+                )
+                usable_actions = actions & principal_actions[principal_arn]
+                allowed_trusts.setdefault(principal_arn, []).append(
+                    (statement_index, usable_actions, condition)
+                )
+
+        partition = role_arn.split(":")[1]
+        for principal_arn, grants in allowed_trusts.items():
+            # Merge wildcard and explicit grants in document order before applying
+            # Denies and aggregating conditions for this concrete principal.
+            grants = sorted(
+                grants
+                + [
+                    (index, actions & principal_actions[principal_arn], condition)
+                    for index, actions, condition in wildcard_grants
+                ],
+                key=lambda grant: grant[0],
+            )
+            denied = denied_actions.get(principal_arn, set()) | denied_actions.get(
+                WILDCARD_PRINCIPAL, set()
+            )
+            if principal_arn in aws_principal_arns:
+                # A Deny naming an account covers every user and role in it, not only
+                # its root user.
+                for account_principal in _account_principals(principal_arn, partition):
+                    denied |= denied_actions.get(account_principal, set())
+            # A statement keeps granting the trust as long as an assume-role action it
+            # lets this principal call is not explicitly denied to it.
+            surviving_conditions = [
+                condition for _, actions, condition in grants if actions - denied
+            ]
+            if not surviving_conditions:
+                continue
+            trust_relationships.append(
+                {
+                    "source_role_arn": role_arn,
+                    "target_principal_arn": principal_arn,
+                    **_aggregate_trust_conditions(
+                        surviving_conditions,
+                        is_aws_principal=principal_arn in aws_principal_arns,
+                    ),
+                }
+            )
+
+        role_record = {
+            "arn": role["Arn"],
+            "roleid": role["RoleId"],
+            "name": role["RoleName"],
+            "path": role["Path"],
+            "createdate": str(role["CreateDate"]),
+            "createdate_dt": role["CreateDate"],
+            "account_id": get_account_from_arn(role["Arn"]),
+        }
+        role_data.append(role_record)
+
+    return TransformedRoleData(
+        role_data=role_data,
+        trust_relationships=trust_relationships,
+        federated_principals=federated_principals,
+        service_principals=service_principals,
+        external_aws_accounts=external_aws_accounts,
+    )
+
+
+@timeit
+def load_users(
+    neo4j_session: neo4j.Session,
+    users: List[Dict],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        AWSUserSchema(),
+        users,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
 
 
 @timeit
 def load_groups(
-    neo4j_session: neo4j.Session, groups: List[Dict], current_aws_account_id: str, aws_update_tag: int,
+    neo4j_session: neo4j.Session,
+    groups: List[Dict],
+    current_aws_account_id: str,
+    aws_update_tag: int,
 ) -> None:
-    ingest_group = """
-    MERGE (gnode:AWSGroup{arn: {ARN}})
-    ON CREATE SET gnode.groupid = {GROUP_ID}, gnode.firstseen = timestamp(), gnode.createdate = {CREATE_DATE}
-    SET gnode:AWSPrincipal, gnode.name = {GROUP_NAME}, gnode.path = {PATH},gnode.lastupdated = {aws_update_tag}
-    WITH gnode
-    MATCH (aa:AWSAccount{id: {AWS_ACCOUNT_ID}})
-    MERGE (aa)-[r:RESOURCE]->(gnode)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {aws_update_tag}
-    """
-    logger.info(f"Loading {len(groups)} IAM groups to the graph.")
-    for group in groups:
-        neo4j_session.run(
-            ingest_group,
-            ARN=group["Arn"],
-            GROUP_ID=group["GroupId"],
-            CREATE_DATE=str(group["CreateDate"]),
-            GROUP_NAME=group["GroupName"],
-            PATH=group["Path"],
-            AWS_ACCOUNT_ID=current_aws_account_id,
-            aws_update_tag=aws_update_tag,
-        )
+    load(
+        neo4j_session,
+        AWSGroupSchema(),
+        groups,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
+
+
+@timeit
+def load_access_keys(
+    neo4j_session: neo4j.Session,
+    access_keys: List[Dict],
+    aws_update_tag: int,
+    current_aws_account_id: str,
+) -> None:
+    load(
+        neo4j_session,
+        AccountAccessKeySchema(),
+        access_keys,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
 
 
 def _parse_principal_entries(principal: Dict) -> List[Tuple[Any, Any]]:
@@ -275,178 +1210,60 @@ def _parse_principal_entries(principal: Dict) -> List[Tuple[Any, Any]]:
 
 
 @timeit
-def load_roles(
-    neo4j_session: neo4j.Session, roles: List[Dict], current_aws_account_id: str, aws_update_tag: int,
-) -> None:
-    ingest_role = """
-    MERGE (rnode:AWSRole{arn: {Arn}})
-    ON CREATE SET rnode:AWSPrincipal, rnode.roleid = {RoleId}, rnode.firstseen = timestamp(),
-    rnode.createdate = {CreateDate}
-    ON MATCH SET rnode.name = {RoleName}, rnode.path = {Path}
-    SET rnode.lastupdated = {aws_update_tag}
-    WITH rnode
-    MATCH (aa:AWSAccount{id: {AWS_ACCOUNT_ID}})
-    MERGE (aa)-[r:RESOURCE]->(rnode)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {aws_update_tag}
-    """
-
-    ingest_policy_statement = """
-    MERGE (spnnode:AWSPrincipal{arn: {SpnArn}})
-    ON CREATE SET spnnode.firstseen = timestamp()
-    SET spnnode.lastupdated = {aws_update_tag}, spnnode.type = {SpnType}
-    WITH spnnode
-    MATCH (role:AWSRole{arn: {RoleArn}})
-    MERGE (role)-[r:TRUSTS_AWS_PRINCIPAL]->(spnnode)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {aws_update_tag}
-    """
-
-    # TODO support conditions
-    logger.info(f"Loading {len(roles)} IAM roles to the graph.")
-    for role in roles:
-        neo4j_session.run(
-            ingest_role,
-            Arn=role["Arn"],
-            RoleId=role["RoleId"],
-            CreateDate=str(role["CreateDate"]),
-            RoleName=role["RoleName"],
-            Path=role["Path"],
-            AWS_ACCOUNT_ID=current_aws_account_id,
-            aws_update_tag=aws_update_tag,
-        )
-
-        for statement in role["AssumeRolePolicyDocument"]["Statement"]:
-            principal_entries = _parse_principal_entries(statement["Principal"])
-            for principal_type, principal_value in principal_entries:
-                neo4j_session.run(
-                    ingest_policy_statement,
-                    SpnArn=principal_value,
-                    SpnType=principal_type,
-                    RoleArn=role['Arn'],
-                    aws_update_tag=aws_update_tag,
-                )
-
-
-@timeit
-def load_group_memberships(neo4j_session: neo4j.Session, group_memberships: Dict, aws_update_tag: int) -> None:
-    ingest_membership = """
-    MATCH (group:AWSGroup{arn: {GroupArn}})
-    WITH group
-    MATCH (user:AWSUser{arn: {PrincipalArn}})
-    MERGE (user)-[r:MEMBER_AWS_GROUP]->(group)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {aws_update_tag}
-    WITH user, group
-    MATCH (group)-[:POLICY]->(policy:AWSPolicy)
-    MERGE (user)-[r2:POLICY]->(policy)
-    SET r2.lastupdated = {aws_update_tag}
-    """
-
-    for group_arn, membership_data in group_memberships.items():
-        for info in membership_data.get("Users", []):
-            principal_arn = info["Arn"]
-            neo4j_session.run(
-                ingest_membership,
-                GroupArn=group_arn,
-                PrincipalArn=principal_arn,
-                aws_update_tag=aws_update_tag,
-            )
-
-
-@timeit
-def get_policies_for_principal(neo4j_session: neo4j.Session, principal_arn: str) -> Dict:
-    get_policy_query = """
-    MATCH
-    (principal:AWSPrincipal{arn:{Arn}})-[:POLICY]->
-    (policy:AWSPolicy)-[:STATEMENT]->
-    (statements:AWSPolicyStatement)
-    RETURN
-    DISTINCT policy.id AS policy_id,
-    COLLECT(DISTINCT statements) AS statements
-    """
-    results = neo4j_session.run(
-        get_policy_query,
-        Arn=principal_arn,
-    )
-    policies = {r["policy_id"]: parse_statement_node(r["statements"]) for r in results}
-    return policies
-
-
-@timeit
 def sync_assumerole_relationships(
-    neo4j_session: neo4j.Session, current_aws_account_id: str, aws_update_tag: str,
+    neo4j_session: neo4j.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
     common_job_parameters: Dict,
 ) -> None:
     # Must be called after load_role
-    # Computes and syncs the STS_ASSUME_ROLE allow relationship
-    logger.info("Syncing assume role mappings for account '%s'.", current_aws_account_id)
+    # Computes and syncs the STS_ASSUMEROLE_ALLOW relationship
+    logger.info(
+        "Syncing assume role mappings for account '%s'.",
+        current_aws_account_id,
+    )
     query_potential_matches = """
-    MATCH (:AWSAccount{id:{AccountId}})-[:RESOURCE]->(target:AWSRole)-[:TRUSTS_AWS_PRINCIPAL]->(source:AWSPrincipal)
-    WHERE NOT source.arn ENDS WITH 'root'
-    AND NOT source.type = 'Service'
-    AND NOT source.type = 'Federated'
-    RETURN target.arn AS target_arn,
-    source.arn AS source_arn
+    MATCH (:AWSAccount{id:$AccountId})-[:RESOURCE]->(target:AWSRole)-[:TRUSTS_AWS_PRINCIPAL]->(source:AWSPrincipal)
+    WHERE NOT source:AWSRootPrincipal
+    AND NOT source:AWSServicePrincipal
+    AND NOT source:AWSFederatedPrincipal
+    RETURN target.arn AS target_arn, source.arn AS source_arn
     """
-
-    ingest_policies_assume_role = """
-    MATCH (source:AWSPrincipal{arn: {SourceArn}})
-    WITH source
-    MATCH (role:AWSRole{arn: {TargetArn}})
-    WITH role, source
-    MERGE (source)-[r:STS_ASSUMEROLE_ALLOW]->(role)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {aws_update_tag}
-    """
-
-    results = neo4j_session.run(
+    results = neo4j_session.execute_read(
+        read_list_of_dicts_tx,
         query_potential_matches,
         AccountId=current_aws_account_id,
     )
-    potential_matches = [(r["source_arn"], r["target_arn"]) for r in results]
-    for source_arn, target_arn in potential_matches:
+
+    # Filter potential matches to only those where the source principal has sts:AssumeRole permission
+    valid_matches = []
+    for result in results:
+        source_arn = result["source_arn"]
+        target_arn = result["target_arn"]
         policies = get_policies_for_principal(neo4j_session, source_arn)
         if principal_allowed_on_resource(policies, target_arn, ["sts:AssumeRole"]):
-            neo4j_session.run(
-                ingest_policies_assume_role,
-                SourceArn=source_arn,
-                TargetArn=target_arn,
-                aws_update_tag=aws_update_tag,
+            valid_matches.append(
+                {
+                    "source_arn": source_arn,
+                    "target_arn": target_arn,
+                }
             )
-    run_cleanup_job(
-        'aws_import_roles_policy_cleanup.json',
+
+    load_matchlinks(
         neo4j_session,
-        common_job_parameters,
+        STSAssumeRoleAllowMatchLink(),
+        valid_matches,
+        lastupdated=aws_update_tag,
+        _sub_resource_label="AWSAccount",
+        _sub_resource_id=current_aws_account_id,
     )
 
-
-@timeit
-def load_user_access_keys(neo4j_session: neo4j.Session, user_access_keys: Dict, aws_update_tag: int) -> None:
-    # TODO change the node label to reflect that this is a user access key, not an account access key
-    ingest_account_key = """
-    MATCH (user:AWSUser{name: {UserName}})
-    WITH user
-    MERGE (key:AccountAccessKey{accesskeyid: {AccessKeyId}})
-    ON CREATE SET key.firstseen = timestamp(), key.createdate = {CreateDate}
-    SET key.status = {Status}, key.lastupdated = {aws_update_tag}
-    WITH user,key
-    MERGE (user)-[r:AWS_ACCESS_KEY]->(key)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {aws_update_tag}
-    """
-
-    for username, access_keys in user_access_keys.items():
-        for key in access_keys["AccessKeyMetadata"]:
-            if key.get('AccessKeyId'):
-                neo4j_session.run(
-                    ingest_account_key,
-                    UserName=username,
-                    AccessKeyId=key['AccessKeyId'],
-                    CreateDate=str(key['CreateDate']),
-                    Status=key['Status'],
-                    aws_update_tag=aws_update_tag,
-                )
+    GraphJob.from_matchlink(
+        STSAssumeRoleAllowMatchLink(),
+        sub_resource_label="AWSAccount",
+        sub_resource_id=current_aws_account_id,
+        update_tag=aws_update_tag,
+    ).run(neo4j_session)
 
 
 def ensure_list(obj: Any) -> List[Any]:
@@ -455,277 +1272,1390 @@ def ensure_list(obj: Any) -> List[Any]:
     return obj
 
 
-def _transform_policy_statements(statements: Any, policy_id: str) -> List[Dict]:
+def _transform_policy_statements(
+    statements: Any, policy_id: str
+) -> list[dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
     count = 1
+
     if not isinstance(statements, list):
         statements = [statements]
+
     for stmt in statements:
-        if "Sid" not in stmt:
+        # Determine statement ID
+        if "Sid" in stmt and stmt["Sid"]:
+            statement_id = stmt["Sid"]
+        else:
             statement_id = count
             count += 1
-        else:
-            statement_id = stmt["Sid"]
-        stmt["id"] = f"{policy_id}/statement/{statement_id}"
+
+        transformed_stmt = {
+            "id": f"{policy_id}/statement/{statement_id}",
+            "policy_id": policy_id,  # For the relationship to AWSPolicy
+            "Effect": stmt.get("Effect"),
+            "Sid": stmt.get("Sid"),
+        }
+
+        # Handle list fields
         if "Resource" in stmt:
-            stmt["Resource"] = ensure_list(stmt["Resource"])
+            transformed_stmt["Resource"] = ensure_list(stmt["Resource"])
         if "Action" in stmt:
-            stmt["Action"] = ensure_list(stmt["Action"])
+            transformed_stmt["Action"] = ensure_list(stmt["Action"])
         if "NotAction" in stmt:
-            stmt["NotAction"] = ensure_list(stmt["NotAction"])
+            transformed_stmt["NotAction"] = ensure_list(stmt["NotAction"])
         if "NotResource" in stmt:
-            stmt["NotResource"] = ensure_list(stmt["NotResource"])
+            transformed_stmt["NotResource"] = ensure_list(stmt["NotResource"])
         if "Condition" in stmt:
-            stmt["Condition"] = json.dumps(ensure_list(stmt["Condition"]))
-    return statements
+            transformed_stmt["Condition"] = json.dumps(ensure_list(stmt["Condition"]))
+
+        result.append(transformed_stmt)
+
+    return result
 
 
-def transform_policy_data(policy_map: Dict, policy_type: str) -> None:
-    for principal_arn, policy_list in policy_map.items():
-        logger.debug(f"Syncing IAM {policy_type} policies for principal {principal_arn}")
-        for policy_name, statements in policy_list.items():
-            policy_id = transform_policy_id(principal_arn, policy_type, policy_name)
-            statements = _transform_policy_statements(
-                statements, policy_id,
+def transform_policy_data(
+    policy_map: dict[str, dict[str, Any]], policy_type: str
+) -> TransformedPolicyData:
+    """
+    Processes AWS IAM policy documents. Returns a TransformedPolicyData object containing the managed policies, inline policies, and statements by policy id -- all ready to be loaded to the graph.
+    """
+    # First pass: collect all policies and their principals
+    policy_to_principals: dict[str, set[str]] = {}
+    policy_to_statements: dict[str, list[dict[str, Any]]] = {}
+    policy_to_name: dict[str, str] = {}
+
+    # get_*_policy_data wears @aws_handle_regions, which returns [] (not a dict)
+    # on AccessDenied / SCP-deny. Coerce so a skipped getter loads nothing
+    # instead of crashing the whole account sync.
+    for principal_arn, policy_statement_map in (policy_map or {}).items():
+        for policy_key, statements in policy_statement_map.items():
+            policy_id = (
+                transform_policy_id(principal_arn, policy_type, policy_key)
+                if policy_type == PolicyType.inline.value
+                else policy_key
             )
+            policy_name = (
+                policy_key
+                if policy_type == PolicyType.inline.value
+                else get_policy_name_from_arn(policy_key)
+            )
+            # Map policy id to the principal arns that have it
+            if policy_id not in policy_to_principals:
+                policy_to_principals[policy_id] = set()
+            policy_to_principals[policy_id].add(principal_arn)
+
+            # Map policy id to policy name
+            policy_to_name[policy_id] = policy_name
+
+            # Transform and store statements
+            transformed_statements = _transform_policy_statements(
+                statements,
+                policy_id,
+            )
+            policy_to_statements[policy_id] = transformed_statements
+
+    # Second pass: create consolidated policy data
+    managed_policy_data = []
+    inline_policy_data = []
+
+    for policy_id, principal_arns in policy_to_principals.items():
+        policy_name = policy_to_name[policy_id]
+
+        policy_data = {
+            "id": policy_id,
+            "name": policy_name,
+            "type": policy_type,
+            # AWS inline policies don't have arns
+            "arn": policy_id if policy_type == PolicyType.managed.value else None,
+            "principal_arns": list(principal_arns),
+        }
+
+        if policy_type == PolicyType.inline.value:
+            inline_policy_data.append(policy_data)
+        elif policy_type == PolicyType.managed.value:
+            managed_policy_data.append(policy_data)
+        else:
+            # This really should never happen so just explicitly having a `pass` here.
+            pass
+
+    return TransformedPolicyData(
+        managed_policies=managed_policy_data,
+        inline_policies=inline_policy_data,
+        statements_by_policy_id=policy_to_statements,
+    )
 
 
 def transform_policy_id(principal_arn: str, policy_type: str, name: str) -> str:
     return f"{principal_arn}/{policy_type}_policy/{name}"
 
 
-def _load_policy_tx(
-    tx: neo4j.Transaction, policy_id: str, policy_name: str, policy_type: str, principal_arn: str,
+def _load_policy(
+    neo4j_session: neo4j.Session,
+    managed_policy_data: list[dict[str, Any]],
+    inline_policy_data: list[dict[str, Any]],
+    account_id: str,
     aws_update_tag: int,
 ) -> None:
-    ingest_policy = """
-    MERGE (policy:AWSPolicy{id: {PolicyId}})
-    ON CREATE SET
-        policy.firstseen = timestamp(),
-        policy.type = {PolicyType},
-        policy.name = {PolicyName}
-    SET policy.lastupdated = {aws_update_tag}
-    WITH policy
-    MATCH (principal:AWSPrincipal{arn: {PrincipalArn}})
-    MERGE (policy) <-[r:POLICY]-(principal)
-    SET r.lastupdated = {aws_update_tag}
-    """
-    tx.run(
-        ingest_policy,
-        PolicyId=policy_id,
-        PolicyName=policy_name,
-        PolicyType=policy_type,
-        PrincipalArn=principal_arn,
-        aws_update_tag=aws_update_tag,
+    load(
+        neo4j_session,
+        AWSManagedPolicySchema(),
+        managed_policy_data,
+        lastupdated=aws_update_tag,
+    )
+    load(
+        neo4j_session,
+        AWSInlinePolicySchema(),
+        inline_policy_data,
+        lastupdated=aws_update_tag,
+        AWS_ID=account_id,
     )
 
 
 @timeit
-def load_policy(
-    neo4j_session: neo4j.Session, policy_id: str, policy_name: str, policy_type: str, principal_arn: str,
-    aws_update_tag: int,
-) -> None:
-    neo4j_session.write_transaction(_load_policy_tx, policy_id, policy_name, policy_type, principal_arn, aws_update_tag)
-
-
-@timeit
 def load_policy_statements(
-    neo4j_session: neo4j.Session, policy_id: str, policy_name: str, statements: Any,
+    neo4j_session: neo4j.Session,
+    statements: list[dict[str, Any]],
     aws_update_tag: int,
 ) -> None:
-    ingest_policy_statement = """
-        MATCH (policy:AWSPolicy{id: {PolicyId}})
-        WITH policy
-        UNWIND {Statements} as statement_data
-        MERGE (statement:AWSPolicyStatement{id: statement_data.id})
-        SET
-        statement.effect = statement_data.Effect,
-        statement.action = statement_data.Action,
-        statement.notaction = statement_data.NotAction,
-        statement.resource = statement_data.Resource,
-        statement.notresource = statement_data.NotResource,
-        statement.condition = statement_data.Condition,
-        statement.sid = statement_data.Sid,
-        statement.lastupdated = {aws_update_tag}
-        MERGE (policy)-[r:STATEMENT]->(statement)
-        ON CREATE SET r.firstseen = timestamp()
-        SET r.lastupdated = {aws_update_tag}
-        """
-    neo4j_session.run(
-        ingest_policy_statement,
-        PolicyId=policy_id,
-        PolicyName=policy_name,
-        Statements=statements,
-        aws_update_tag=aws_update_tag,
-    ).consume()
+    load(
+        neo4j_session,
+        AWSPolicyStatementSchema(),
+        statements,
+        lastupdated=aws_update_tag,
+        POLICY_ID=statements[0]["policy_id"],
+    )
 
 
 @timeit
-def load_policy_data(neo4j_session: neo4j.Session, policy_map: Dict, policy_type: str, aws_update_tag: int) -> None:
-    for principal_arn, policy_list in policy_map.items():
-        logger.debug(f"Syncing IAM inline policies for principal {principal_arn}")
-        for policy_name, statements in policy_list.items():
-            policy_id = transform_policy_id(principal_arn, policy_type, policy_name)
-            load_policy(neo4j_session, policy_id, policy_name, policy_type, principal_arn, aws_update_tag)
-            load_policy_statements(neo4j_session, policy_id, policy_name, statements, aws_update_tag)
+def _load_policy_statements(
+    neo4j_session: neo4j.Session,
+    policy_statements: dict[str, list[dict[str, Any]]],
+    aws_update_tag: int,
+) -> None:
+    for policy_id, statements in policy_statements.items():
+        load(
+            neo4j_session,
+            AWSPolicyStatementSchema(),
+            statements,
+            lastupdated=aws_update_tag,
+            POLICY_ID=policy_id,
+        )
+
+
+@timeit
+def load_policy_data(
+    neo4j_session: neo4j.Session,
+    transformed_policy_data: TransformedPolicyData,
+    aws_update_tag: int,
+    current_aws_account_id: str,
+) -> None:
+    _load_policy(
+        neo4j_session,
+        transformed_policy_data.managed_policies,
+        transformed_policy_data.inline_policies,
+        current_aws_account_id,
+        aws_update_tag,
+    )
+
+    _load_policy_statements(
+        neo4j_session,
+        transformed_policy_data.statements_by_policy_id,
+        aws_update_tag,
+    )
 
 
 @timeit
 def sync_users(
-    neo4j_session: neo4j.Session, boto3_session: boto3.session.Session, current_aws_account_id: str,
-    aws_update_tag: int, common_job_parameters: Dict,
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
+    common_job_parameters: Dict,
+    policy_statement_cache: Dict[str, Any] | None = None,
+    authorization_details: AccountAuthorizationDetails | None = None,
 ) -> None:
     logger.info("Syncing IAM users for account '%s'.", current_aws_account_id)
     data = get_user_list_data(boto3_session)
-    load_users(neo4j_session, data['Users'], current_aws_account_id, aws_update_tag)
+    user_data = transform_users(data["Users"])
+    load_users(neo4j_session, user_data, current_aws_account_id, aws_update_tag)
 
-    sync_user_inline_policies(boto3_session, data, neo4j_session, aws_update_tag)
-
-    sync_user_managed_policies(boto3_session, data, neo4j_session, aws_update_tag)
-
-    run_cleanup_job('aws_import_users_cleanup.json', neo4j_session, common_job_parameters)
-
-
-@timeit
-def sync_user_managed_policies(
-    boto3_session: boto3.session.Session, data: Dict, neo4j_session: neo4j.Session,
-    aws_update_tag: int,
-) -> None:
-    managed_policy_data = get_user_managed_policy_data(boto3_session, data['Users'])
-    transform_policy_data(managed_policy_data, PolicyType.managed.value)
-    load_policy_data(neo4j_session, managed_policy_data, PolicyType.managed.value, aws_update_tag)
-
-
-@timeit
-def sync_user_inline_policies(
-    boto3_session: boto3.session.Session, data: Dict, neo4j_session: neo4j.Session,
-    aws_update_tag: int,
-) -> None:
-    policy_data = get_user_policy_data(boto3_session, data['Users'])
-    transform_policy_data(policy_data, PolicyType.inline.value)
-    load_policy_data(neo4j_session, policy_data, PolicyType.inline.value, aws_update_tag)
-
-
-@timeit
-def sync_groups(
-    neo4j_session: neo4j.Session, boto3_session: boto3.session.Session, current_aws_account_id: str,
-    aws_update_tag: int, common_job_parameters: Dict,
-) -> None:
-    logger.info("Syncing IAM groups for account '%s'.", current_aws_account_id)
-    data = get_group_list_data(boto3_session)
-    load_groups(neo4j_session, data['Groups'], current_aws_account_id, aws_update_tag)
-
-    sync_groups_inline_policies(boto3_session, data, neo4j_session, aws_update_tag)
-
-    sync_group_managed_policies(boto3_session, data, neo4j_session, aws_update_tag)
-
-    run_cleanup_job('aws_import_groups_cleanup.json', neo4j_session, common_job_parameters)
-
-
-def sync_group_managed_policies(
-    boto3_session: boto3.session.Session, data: Dict, neo4j_session: neo4j.Session,
-    aws_update_tag: int,
-) -> None:
-    managed_policy_data = get_group_managed_policy_data(boto3_session, data["Groups"])
-    transform_policy_data(managed_policy_data, PolicyType.managed.value)
-    load_policy_data(neo4j_session, managed_policy_data, PolicyType.managed.value, aws_update_tag)
-
-
-def sync_groups_inline_policies(
-    boto3_session: boto3.session.Session, data: Dict, neo4j_session: neo4j.Session,
-    aws_update_tag: int,
-) -> None:
-    policy_data = get_group_policy_data(boto3_session, data["Groups"])
-    transform_policy_data(policy_data, PolicyType.inline.value)
-    load_policy_data(neo4j_session, policy_data, PolicyType.inline.value, aws_update_tag)
-
-
-@timeit
-def sync_roles(
-    neo4j_session: neo4j.Session, boto3_session: boto3.session.Session, current_aws_account_id: str,
-    aws_update_tag: int, common_job_parameters: Dict,
-) -> None:
-    logger.info("Syncing IAM roles for account '%s'.", current_aws_account_id)
-    data = get_role_list_data(boto3_session)
-    load_roles(neo4j_session, data['Roles'], current_aws_account_id, aws_update_tag)
-
-    sync_role_inline_policies(current_aws_account_id, boto3_session, data, neo4j_session, aws_update_tag)
-
-    sync_role_managed_policies(current_aws_account_id, boto3_session, data, neo4j_session, aws_update_tag)
-
-    run_cleanup_job('aws_import_roles_cleanup.json', neo4j_session, common_job_parameters)
-
-
-def sync_role_managed_policies(
-    current_aws_account_id: str, boto3_session: boto3.session.Session, data: Dict,
-    neo4j_session: neo4j.Session, aws_update_tag: int,
-) -> None:
-    logger.info("Syncing IAM role managed policies for account '%s'.", current_aws_account_id)
-    managed_policy_data = get_role_managed_policy_data(boto3_session, data["Roles"])
-    transform_policy_data(managed_policy_data, PolicyType.managed.value)
-    load_policy_data(neo4j_session, managed_policy_data, PolicyType.managed.value, aws_update_tag)
-
-
-def sync_role_inline_policies(
-    current_aws_account_id: str, boto3_session: boto3.session.Session, data: Dict,
-    neo4j_session: neo4j.Session, aws_update_tag: int,
-) -> None:
-    logger.info("Syncing IAM role inline policies for account '%s'.", current_aws_account_id)
-    inline_policy_data = get_role_policy_data(boto3_session, data["Roles"])
-    transform_policy_data(inline_policy_data, PolicyType.inline.value)
-    load_policy_data(neo4j_session, inline_policy_data, PolicyType.inline.value, aws_update_tag)
-
-
-@timeit
-def sync_group_memberships(
-    neo4j_session: neo4j.Session, boto3_session: boto3.session.Session,
-    current_aws_account_id: str, aws_update_tag: int, common_job_parameters: Dict,
-) -> None:
-    logger.info("Syncing IAM group membership for account '%s'.", current_aws_account_id)
-    query = "MATCH (group:AWSGroup)<-[:RESOURCE]-(:AWSAccount{id: {AWS_ACCOUNT_ID}}) " \
-            "return group.name as name, group.arn as arn;"
-    groups = neo4j_session.run(query, AWS_ACCOUNT_ID=current_aws_account_id)
-    groups_membership = {group["arn"]: get_group_membership_data(boto3_session, group["name"]) for group in groups}
-    load_group_memberships(neo4j_session, groups_membership, aws_update_tag)
-    run_cleanup_job(
-        'aws_import_groups_membership_cleanup.json',
+    sync_user_inline_policies(
+        boto3_session,
+        data,
         neo4j_session,
-        common_job_parameters,
+        aws_update_tag,
+        current_aws_account_id,
+        policy_data=(
+            authorization_details.user_inline_policies
+            if authorization_details
+            else None
+        ),
+    )
+
+    sync_user_managed_policies(
+        boto3_session,
+        data,
+        neo4j_session,
+        aws_update_tag,
+        current_aws_account_id,
+        policy_statement_cache,
+        policy_data=(
+            authorization_details.user_managed_policies
+            if authorization_details
+            else None
+        ),
+    )
+
+    sync_user_mfa_devices(
+        boto3_session, data, neo4j_session, aws_update_tag, current_aws_account_id
     )
 
 
 @timeit
 def sync_user_access_keys(
-    neo4j_session: neo4j.Session, boto3_session: boto3.session.Session,
-    current_aws_account_id: str, aws_update_tag: int, common_job_parameters: Dict,
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
+    common_job_parameters: Dict,
 ) -> None:
-    logger.info("Syncing IAM user access keys for account '%s'.", current_aws_account_id)
-    query = "MATCH (user:AWSUser)<-[:RESOURCE]-(:AWSAccount{id: {AWS_ACCOUNT_ID}}) return user.name as name"
-    result = neo4j_session.run(query, AWS_ACCOUNT_ID=current_aws_account_id)
-    usernames = [r['name'] for r in result]
-    for name in usernames:
-        access_keys = get_account_access_key_data(boto3_session, name)
-        if access_keys:
-            account_access_keys = {name: access_keys}
-            load_user_access_keys(neo4j_session, account_access_keys, aws_update_tag)
-    run_cleanup_job(
-        'aws_import_account_access_key_cleanup.json',
+    logger.info(
+        "Syncing IAM user access keys for account '%s'.", current_aws_account_id
+    )
+
+    # Query the graph for users instead of making another AWS API call
+    query = (
+        "MATCH (user:AWSUser)<-[:RESOURCE]-(:AWSAccount{id: $AWS_ID}) "
+        "RETURN user.name as name, user.arn as arn"
+    )
+    users = neo4j_session.execute_read(
+        read_list_of_dicts_tx,
+        query,
+        AWS_ID=current_aws_account_id,
+    )
+
+    user_access_keys = get_user_access_keys_data(boto3_session, users)
+    access_key_data = transform_access_keys(user_access_keys)
+    load_access_keys(
+        neo4j_session, access_key_data, aws_update_tag, current_aws_account_id
+    )
+    GraphJob.from_node_schema(AccountAccessKeySchema(), common_job_parameters).run(
+        neo4j_session
+    )
+
+
+@timeit
+def sync_user_managed_policies(
+    boto3_session: boto3.Session,
+    data: Dict,
+    neo4j_session: neo4j.Session,
+    aws_update_tag: int,
+    current_aws_account_id: str,
+    policy_statement_cache: Dict[str, Any] | None = None,
+    policy_data: Dict | None = None,
+) -> None:
+    if policy_statement_cache is None:
+        policy_statement_cache = {}
+    managed_policy_data = (
+        policy_data
+        if policy_data is not None
+        else get_user_managed_policy_data(
+            boto3_session, data["Users"], policy_statement_cache
+        )
+    )
+    transformed_policy_data = transform_policy_data(
+        managed_policy_data, PolicyType.managed.value
+    )
+    load_policy_data(
         neo4j_session,
-        common_job_parameters,
+        transformed_policy_data,
+        aws_update_tag,
+        current_aws_account_id,
+    )
+
+
+@timeit
+def sync_user_inline_policies(
+    boto3_session: boto3.Session,
+    data: Dict,
+    neo4j_session: neo4j.Session,
+    aws_update_tag: int,
+    current_aws_account_id: str,
+    policy_data: Dict | None = None,
+) -> None:
+    if policy_data is None:
+        policy_data = get_user_policy_data(boto3_session, data["Users"])
+    transformed_policy_data = transform_policy_data(
+        policy_data, PolicyType.inline.value
+    )
+    load_policy_data(
+        neo4j_session,
+        transformed_policy_data,
+        aws_update_tag,
+        current_aws_account_id,
+    )
+
+
+@timeit
+@aws_handle_regions
+def get_mfa_devices(
+    boto3_session: boto3.Session,
+    user_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    client = create_boto3_client(boto3_session, "iam")
+    mfa_devices: list[dict[str, Any]] = []
+    for user in user_list:
+        name = user["UserName"]
+        user_arn = user["Arn"]
+        try:
+            paginator = client.get_paginator("list_mfa_devices")
+            for page in paginator.paginate(UserName=name):
+                for device in page["MFADevices"]:
+                    device["UserArn"] = user_arn
+                    mfa_devices.append(device)
+        except client.exceptions.NoSuchEntityException:
+            logger.warning(
+                f"Could not get MFA devices for user {name} due to NoSuchEntityException; skipping.",
+            )
+    return mfa_devices
+
+
+def transform_mfa_devices(mfa_devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    transformed_mfa_devices = []
+    for device in mfa_devices:
+        transformed_mfa_devices.append(
+            {
+                "serialnumber": device["SerialNumber"],
+                "username": device["UserName"],
+                "user_arn": device["UserArn"],
+                "enabledate": str(device["EnableDate"]),
+                "enabledate_dt": device["EnableDate"],
+            }
+        )
+    return transformed_mfa_devices
+
+
+@timeit
+def load_mfa_devices(
+    neo4j_session: neo4j.Session,
+    mfa_devices: List[Dict],
+    aws_update_tag: int,
+    current_aws_account_id: str,
+) -> None:
+    load(
+        neo4j_session,
+        AWSMfaDeviceSchema(),
+        mfa_devices,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
+
+
+@timeit
+def sync_user_mfa_devices(
+    boto3_session: boto3.Session,
+    data: Dict,
+    neo4j_session: neo4j.Session,
+    aws_update_tag: int,
+    current_aws_account_id: str,
+) -> None:
+    logger.info("Syncing IAM MFA Devices for account '%s'.", current_aws_account_id)
+    mfa_devices = get_mfa_devices(boto3_session, data["Users"])
+    transformed_mfa_devices = transform_mfa_devices(mfa_devices)
+    load_mfa_devices(
+        neo4j_session,
+        transformed_mfa_devices,
+        aws_update_tag,
+        current_aws_account_id,
+    )
+
+
+@timeit
+def sync_groups(
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
+    common_job_parameters: Dict,
+    policy_statement_cache: Dict[str, Any] | None = None,
+    authorization_details: AccountAuthorizationDetails | None = None,
+) -> None:
+    logger.info("Syncing IAM groups for account '%s'.", current_aws_account_id)
+    data = get_group_list_data(boto3_session)
+    group_memberships = (
+        authorization_details.group_memberships
+        if authorization_details
+        else get_group_memberships(boto3_session, data["Groups"])
+    )
+    group_data = transform_groups(data["Groups"], group_memberships)
+    load_groups(neo4j_session, group_data, current_aws_account_id, aws_update_tag)
+
+    sync_groups_inline_policies(
+        boto3_session,
+        data,
+        neo4j_session,
+        aws_update_tag,
+        current_aws_account_id,
+        policy_data=(
+            authorization_details.group_inline_policies
+            if authorization_details
+            else None
+        ),
+    )
+
+    sync_group_managed_policies(
+        boto3_session,
+        data,
+        neo4j_session,
+        aws_update_tag,
+        current_aws_account_id,
+        policy_statement_cache,
+        policy_data=(
+            authorization_details.group_managed_policies
+            if authorization_details
+            else None
+        ),
+    )
+
+
+def sync_group_managed_policies(
+    boto3_session: boto3.Session,
+    data: Dict,
+    neo4j_session: neo4j.Session,
+    aws_update_tag: int,
+    current_aws_account_id: str,
+    policy_statement_cache: Dict[str, Any] | None = None,
+    policy_data: Dict | None = None,
+) -> None:
+    if policy_statement_cache is None:
+        policy_statement_cache = {}
+    managed_policy_data = (
+        policy_data
+        if policy_data is not None
+        else get_group_managed_policy_data(
+            boto3_session, data["Groups"], policy_statement_cache
+        )
+    )
+    transformed_policy_data = transform_policy_data(
+        managed_policy_data, PolicyType.managed.value
+    )
+    load_policy_data(
+        neo4j_session,
+        transformed_policy_data,
+        aws_update_tag,
+        current_aws_account_id,
+    )
+
+
+def sync_groups_inline_policies(
+    boto3_session: boto3.Session,
+    data: Dict,
+    neo4j_session: neo4j.Session,
+    aws_update_tag: int,
+    current_aws_account_id: str,
+    policy_data: Dict | None = None,
+) -> None:
+    if policy_data is None:
+        policy_data = get_group_policy_data(boto3_session, data["Groups"])
+    transformed_policy_data = transform_policy_data(
+        policy_data, PolicyType.inline.value
+    )
+    load_policy_data(
+        neo4j_session,
+        transformed_policy_data,
+        aws_update_tag,
+        current_aws_account_id,
+    )
+
+
+def load_external_aws_accounts(
+    neo4j_session: neo4j.Session,
+    external_aws_accounts: list[dict[str, Any]],
+    aws_update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        AWSAccountAWSRoleSchema(),
+        external_aws_accounts,
+        lastupdated=aws_update_tag,
+    )
+    # Ensure that the root principal exists for each external account.
+    for account in external_aws_accounts:
+        sync_root_principal(
+            neo4j_session,
+            account["id"],
+            aws_update_tag,
+            account["partition"],
+        )
+
+
+@timeit
+def load_service_principals(
+    neo4j_session: neo4j.Session,
+    service_principals: list[dict[str, Any]],
+    aws_update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        AWSServicePrincipalSchema(),
+        service_principals,
+        lastupdated=aws_update_tag,
+    )
+
+
+@timeit
+def load_role_data(
+    neo4j_session: neo4j.Session,
+    role_list: list[dict[str, Any]],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    # Note that the account_id is set in the transform_roles function instead of from the `AWS_ID` kwarg like in other modules
+    # because this can create root principals from other accounts based on data from the assume role policy document.
+    load(
+        neo4j_session,
+        AWSRoleSchema(),
+        role_list,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
+
+
+@timeit
+def load_federated_principals(
+    neo4j_session: neo4j.Session,
+    federated_principals: list[dict[str, Any]],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        AWSFederatedPrincipalSchema(),
+        federated_principals,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
+
+
+@timeit
+def load_role_trust_relationships(
+    neo4j_session: neo4j.Session,
+    trust_relationships: list[dict[str, Any]],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    """
+    Load the TRUSTS_AWS_PRINCIPAL edges declared by role trust policies.
+
+    Must be called after the roles and the principals they trust have been loaded: a
+    MatchLink only connects nodes that already exist, so a trust naming a principal in an
+    account outside the sync perimeter draws no edge, same as before.
+    """
+    load_matchlinks(
+        neo4j_session,
+        AWSRoleTrustsPrincipalMatchLink(),
+        trust_relationships,
+        lastupdated=aws_update_tag,
+        _sub_resource_label="AWSAccount",
+        _sub_resource_id=current_aws_account_id,
+    )
+
+
+# DEPRECATED: This compatibility migration will be removed in v1.0.0.
+def _cleanup_legacy_role_trust_relationships(
+    neo4j_session: neo4j.Session,
+    current_aws_account_id: str,
+) -> None:
+    """Delete stale TRUSTS_AWS_PRINCIPAL edges written before the edge became a MatchLink.
+
+    The node-schema relationship that used to draw this edge set no _sub_resource_label
+    or _sub_resource_id on it, and the MatchLink cleanup selects stale edges by those
+    properties, so an edge from that era whose trust has since been removed would never
+    be deleted. load_role_trust_relationships merges onto an existing edge and stamps
+    both properties, so once it has run every edge still declared by a trust policy in
+    this account carries them; whatever is left without them is stale.
+    """
+    statement = GraphStatement(
+        """
+        MATCH (:AWSAccount{id: $AWS_ID})-[:RESOURCE]->(:AWSRole)-[r:TRUSTS_AWS_PRINCIPAL]->(:AWSPrincipal)
+        WHERE r._sub_resource_id IS NULL
+        WITH r LIMIT $LIMIT_SIZE
+        DELETE r
+        """,
+        parameters={"AWS_ID": current_aws_account_id},
+        iterative=True,
+        iterationsize=10000,
+        parent_job_name="legacy_role_trust_cleanup",
+    )
+    GraphJob(
+        "Cleanup legacy TRUSTS_AWS_PRINCIPAL relationships",
+        [statement],
+        "legacy_role_trust_cleanup",
+    ).run(neo4j_session)
+
+
+@timeit
+def sync_role_assumptions(
+    neo4j_session: neo4j.Session,
+    data: dict[str, Any],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    transformed = transform_role_trust_policies(data["Roles"], current_aws_account_id)
+
+    # Order matters here.
+    # External accounts come first because they need to be created before the roles that trust them.
+    load_external_aws_accounts(
+        neo4j_session, transformed.external_aws_accounts, aws_update_tag
+    )
+    # Service principals e.g. arn = "ec2.amazonaws.com" come next because they're global
+    load_service_principals(
+        neo4j_session, transformed.service_principals, aws_update_tag
+    )
+    load_federated_principals(
+        neo4j_session,
+        transformed.federated_principals,
+        current_aws_account_id,
+        aws_update_tag,
+    )
+    load_role_data(
+        neo4j_session, transformed.role_data, current_aws_account_id, aws_update_tag
+    )
+    # The trust edges come last: a MatchLink connects nodes that already exist, so both
+    # the roles and the principals they trust must be in the graph by this point.
+    load_role_trust_relationships(
+        neo4j_session,
+        transformed.trust_relationships,
+        current_aws_account_id,
+        aws_update_tag,
+    )
+
+
+@timeit
+def transform_server_certificates(certificates: List[Dict]) -> List[Dict]:
+    transformed_certs = []
+    for cert in certificates:
+        transformed_certs.append(
+            {
+                "ServerCertificateName": cert["ServerCertificateName"],
+                "ServerCertificateId": cert["ServerCertificateId"],
+                "Arn": cert["Arn"],
+                "Path": cert["Path"],
+                "Expiration": cert["Expiration"],
+                "UploadDate": cert["UploadDate"],
+            }
+        )
+    return transformed_certs
+
+
+@timeit
+def load_server_certificates(
+    neo4j_session: neo4j.Session,
+    data: List[Dict],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        AWSServerCertificateSchema(),
+        data,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
+
+
+@timeit
+def get_account_summary(boto3_session: boto3.Session) -> Dict[str, int]:
+    client = create_boto3_client(boto3_session, "iam")
+    response = client.get_account_summary()
+    return response["SummaryMap"]
+
+
+def transform_account_summary(
+    summary_map: Dict[str, int],
+    current_aws_account_id: str,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": current_aws_account_id,
+            **summary_map,
+        },
+    ]
+
+
+@timeit
+def load_account_summary(
+    neo4j_session: neo4j.Session,
+    data: list[dict[str, Any]],
+    aws_update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        AWSAccountSummarySchema(),
+        data,
+        lastupdated=aws_update_tag,
+    )
+
+
+@timeit
+def sync_account_summary(
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    logger.info(
+        "Syncing IAM Account Summary for account '%s'.",
+        current_aws_account_id,
+    )
+    summary_map = get_account_summary(boto3_session)
+    transformed = transform_account_summary(summary_map, current_aws_account_id)
+    load_account_summary(neo4j_session, transformed, aws_update_tag)
+
+
+@timeit
+def sync_server_certificates(
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
+    common_job_parameters: Dict,
+) -> None:
+    logger.info(
+        "Syncing IAM Server Certificates for account '%s'.", current_aws_account_id
+    )
+    raw_data = get_server_certificates(boto3_session)
+    data = transform_server_certificates(raw_data)
+    load_server_certificates(
+        neo4j_session, data, current_aws_account_id, aws_update_tag
+    )
+
+
+@timeit
+def sync_roles(
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
+    common_job_parameters: Dict,
+    policy_statement_cache: Dict[str, Any] | None = None,
+    authorization_details: AccountAuthorizationDetails | None = None,
+) -> None:
+    logger.info("Syncing IAM roles for account '%s'.", current_aws_account_id)
+    data = get_role_list_data(boto3_session)
+
+    sync_role_assumptions(neo4j_session, data, current_aws_account_id, aws_update_tag)
+
+    sync_role_inline_policies(
+        current_aws_account_id,
+        boto3_session,
+        data,
+        neo4j_session,
+        aws_update_tag,
+        policy_data=(
+            authorization_details.role_inline_policies
+            if authorization_details
+            else None
+        ),
+    )
+
+    sync_role_managed_policies(
+        current_aws_account_id,
+        boto3_session,
+        data,
+        neo4j_session,
+        aws_update_tag,
+        policy_statement_cache,
+        policy_data=(
+            authorization_details.role_managed_policies
+            if authorization_details
+            else None
+        ),
+    )
+
+
+def sync_role_managed_policies(
+    current_aws_account_id: str,
+    boto3_session: boto3.Session,
+    data: Dict,
+    neo4j_session: neo4j.Session,
+    aws_update_tag: int,
+    policy_statement_cache: Dict[str, Any] | None = None,
+    policy_data: Dict | None = None,
+) -> None:
+    logger.info(
+        "Syncing IAM role managed policies for account '%s'.",
+        current_aws_account_id,
+    )
+    if policy_statement_cache is None:
+        policy_statement_cache = {}
+    managed_policy_data = (
+        policy_data
+        if policy_data is not None
+        else get_role_managed_policy_data(
+            boto3_session, data["Roles"], policy_statement_cache
+        )
+    )
+    transformed_policy_data = transform_policy_data(
+        managed_policy_data, PolicyType.managed.value
+    )
+    load_policy_data(
+        neo4j_session,
+        transformed_policy_data,
+        aws_update_tag,
+        current_aws_account_id,
+    )
+
+
+def sync_role_inline_policies(
+    current_aws_account_id: str,
+    boto3_session: boto3.Session,
+    data: Dict,
+    neo4j_session: neo4j.Session,
+    aws_update_tag: int,
+    policy_data: Dict | None = None,
+) -> None:
+    logger.info(
+        "Syncing IAM role inline policies for account '%s'.",
+        current_aws_account_id,
+    )
+    inline_policy_data = (
+        policy_data
+        if policy_data is not None
+        else get_role_policy_data(boto3_session, data["Roles"])
+    )
+    transformed_policy_data = transform_policy_data(
+        inline_policy_data, PolicyType.inline.value
+    )
+    load_policy_data(
+        neo4j_session,
+        transformed_policy_data,
+        aws_update_tag,
+        current_aws_account_id,
+    )
+
+
+def _get_policies_in_current_account(
+    neo4j_session: neo4j.Session, current_aws_account_id: str
+) -> list[str]:
+    query = """
+    MATCH (:AWSAccount{id: $AWS_ID})-[:RESOURCE]->(p:AWSPolicy)
+    RETURN p.id
+    """
+    return [
+        str(policy_id)
+        for policy_id in neo4j_session.execute_read(
+            read_list_of_values_tx,
+            query,
+            AWS_ID=current_aws_account_id,
+        )
+    ]
+
+
+def _get_principals_with_pols_in_current_account(
+    neo4j_session: neo4j.Session, current_aws_account_id: str
+) -> list[str]:
+    query = """
+    MATCH (:AWSAccount{id: $AWS_ID})-[:RESOURCE]->(p:AWSPrincipal)
+    WHERE (p)-[:POLICY]->(:AWSPolicy)
+    RETURN p.id
+    """
+    return [
+        str(principal_id)
+        for principal_id in neo4j_session.execute_read(
+            read_list_of_values_tx,
+            query,
+            AWS_ID=current_aws_account_id,
+        )
+    ]
+
+
+@timeit
+def cleanup_iam(neo4j_session: neo4j.Session, common_job_parameters: Dict) -> None:
+    # List all policies in the current account
+    policy_ids = _get_policies_in_current_account(
+        neo4j_session, common_job_parameters["AWS_ID"]
+    )
+
+    # for each policy id, run the cleanup job for the policy statements, passing the policy id as a kwarg.
+    for policy_id in policy_ids:
+        GraphJob.from_node_schema(
+            AWSPolicyStatementSchema(),
+            {**common_job_parameters, "POLICY_ID": policy_id},
+        ).run(
+            neo4j_session,
+        )
+
+    # Next, clean up the policies
+    # Note that managed policies don't have a sub resource relationship. This means that we will only clean up
+    # stale relationships and not stale AWSManagedPolicy nodes. This is because AWSManagedPolicy nodes are global
+    # to AWS and it is possible for them to be shared across accounts, so if we cleaned up an AWSManagedPolicy node
+    # for one account, it would be erroneously deleted for all accounts. Instead, we just clean up the relationships.
+    GraphJob.from_node_schema(AWSManagedPolicySchema(), common_job_parameters).run(
+        neo4j_session
+    )
+
+    # Inline policies are simpler in that they are scoped to a single principal and therefore attached to that
+    # principal's account. This means that this operation will clean up stale AWSInlinePolicy nodes.
+    GraphJob.from_node_schema(AWSInlinePolicySchema(), common_job_parameters).run(
+        neo4j_session
+    )
+
+    # Clean up roles before federated and service principals
+    GraphJob.from_node_schema(AWSRoleSchema(), common_job_parameters).run(neo4j_session)
+    GraphJob.from_matchlink(
+        AWSRoleTrustsPrincipalMatchLink(),
+        sub_resource_label="AWSAccount",
+        sub_resource_id=common_job_parameters["AWS_ID"],
+        update_tag=common_job_parameters["UPDATE_TAG"],
+    ).run(neo4j_session)
+    # Edges written before the MatchLink migration carry none of the properties the
+    # cleanup above selects on, so stale ones from that era need their own pass.
+    _cleanup_legacy_role_trust_relationships(
+        neo4j_session, common_job_parameters["AWS_ID"]
+    )
+    GraphJob.from_node_schema(AWSFederatedPrincipalSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+    GraphJob.from_node_schema(AWSServicePrincipalSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+    GraphJob.from_node_schema(AWSMfaDeviceSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+    GraphJob.from_node_schema(AWSUserSchema(), common_job_parameters).run(neo4j_session)
+    GraphJob.from_node_schema(AWSGroupSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+    GraphJob.from_node_schema(AWSServerCertificateSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+    GraphJob.from_node_schema(AWSSAMLProviderSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+    # Removes a root principal that no sync refreshed, e.g. one built with the wrong partition.
+    GraphJob.from_node_schema(AWSRootPrincipalSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+
+
+def sync_root_principal(
+    neo4j_session: neo4j.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
+    partition: str,
+) -> None:
+    """
+    In the current account, create a node for the AWS root principal "arn:<partition>:iam::<account_id>:root".
+
+    If a role X trusts the root principal in an account A, then any other role Y in A can assume X.
+
+    Note that this is _not_ the same as the AWS root user. The root principal doesn't show up in any
+    APIs except for assumerole trust policies.
+    """
+    load(
+        neo4j_session,
+        AWSRootPrincipalSchema(),
+        [{"arn": f"arn:{partition}:iam::{current_aws_account_id}:root"}],
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
+
+
+@backoff.on_exception(  # type: ignore[misc]
+    backoff.expo,
+    ClientError,
+    max_time=600,
+    giveup=lambda e: not _is_iam_throttling_error(e),
+    on_backoff=backoff_handler,
+)
+def _call_iam_with_throttle_retry(
+    operation: Callable[..., Dict], **kwargs: Any
+) -> Dict:
+    # Retried per call so a throttled poll keeps its job instead of starting over.
+    return operation(**kwargs)
+
+
+def _is_access_denied(error: ClientError) -> bool:
+    # Only a denial is per principal. Credential failures such as
+    # InvalidClientTokenId affect every principal and must fail the sync.
+    return error.response.get("Error", {}).get("Code") in (
+        "AccessDenied",
+        "AccessDeniedException",
+    )
+
+
+def _get_service_last_accessed_job_result(client: Any, arn: str, job_id: str) -> Dict:
+    try:
+        max_attempts = 30
+        for attempt in range(max_attempts):
+            # The API maximum: at the default of 100, a principal with broad
+            # permissions needs several pages, each a call against the rate limit.
+            job_response = _call_iam_with_throttle_retry(
+                client.get_service_last_accessed_details,
+                JobId=job_id,
+                MaxItems=1000,
+            )
+
+            if job_response["JobStatus"] == "COMPLETED":
+                # Handle pagination - collect all services
+                all_services = job_response.get("ServicesLastAccessed", [])
+
+                while job_response.get("IsTruncated", False):
+                    marker = job_response.get("Marker")
+                    if not marker:
+                        break
+                    job_response = _call_iam_with_throttle_retry(
+                        client.get_service_last_accessed_details,
+                        JobId=job_id,
+                        MaxItems=1000,
+                        Marker=marker,
+                    )
+                    all_services.extend(job_response.get("ServicesLastAccessed", []))
+
+                # Return complete response with all services
+                job_response["ServicesLastAccessed"] = all_services
+                return job_response
+            elif job_response["JobStatus"] == "FAILED":
+                logger.warning(
+                    f"Service last accessed job failed for ARN {arn}: {job_response.get('JobCompletionDate', 'Unknown error')}"
+                )
+                return {}
+
+            time.sleep(2)
+
+        logger.warning(f"Service last accessed job timed out for ARN {arn}")
+        return {}
+
+    except client.exceptions.NoSuchEntityException:
+        logger.warning(
+            f"Principal {arn} not found for service last accessed details",
+            exc_info=True,
+        )
+        return {}
+    except ClientError as e:
+        if not _is_access_denied(e):
+            raise
+        logger.warning(f"Skipping service last accessed details for {arn}: {e}")
+        return {}
+
+
+@timeit
+def get_service_last_accessed_details(
+    boto3_session: boto3.session.Session, principal_arns: List[str]
+) -> List[Tuple[str, Dict]]:
+    """
+    Get service last accessed details for a batch of principals.
+
+    Every job in the batch is generated before any is polled, so IAM builds the
+    reports concurrently and a whole batch waits about as long as one job.
+    """
+    client = create_boto3_client(boto3_session, "iam")
+
+    job_ids: Dict[str, str] = {}
+    for arn in principal_arns:
+        try:
+            job_ids[arn] = _call_iam_with_throttle_retry(
+                client.generate_service_last_accessed_details, Arn=arn
+            )["JobId"]
+        except client.exceptions.NoSuchEntityException:
+            logger.warning(
+                f"Principal {arn} not found for service last accessed details",
+                exc_info=True,
+            )
+        # Skipped here rather than by @aws_handle_regions, which would drop the
+        # whole batch for one principal's denial.
+        except ClientError as e:
+            if not _is_access_denied(e):
+                raise
+            logger.warning(f"Skipping service last accessed details for {arn}: {e}")
+
+    return [
+        (arn, _get_service_last_accessed_job_result(client, arn, job_id))
+        for arn, job_id in job_ids.items()
+    ]
+
+
+def transform_service_last_accessed_details(
+    service_details_by_principal: List[Tuple[str, Dict]],
+) -> List[Dict]:
+    """
+    Keep only the most recently accessed service for each principal.
+    """
+    principal_data = []
+    for principal_arn, service_details in service_details_by_principal:
+        services = service_details.get("ServicesLastAccessed", [])
+        accessed_services = [s for s in services if s.get("LastAuthenticated")]
+
+        if not accessed_services:
+            continue
+
+        most_recent_service = max(
+            accessed_services, key=lambda s: s.get("LastAuthenticated")
+        )
+
+        principal_data.append(
+            {
+                "arn": principal_arn,
+                "last_accessed_service_name": most_recent_service.get("ServiceName"),
+                "last_accessed_service_namespace": most_recent_service.get(
+                    "ServiceNamespace"
+                ),
+                "last_authenticated": str(
+                    most_recent_service.get("LastAuthenticated", "")
+                ),
+                "last_authenticated_entity": most_recent_service.get(
+                    "LastAuthenticatedEntity", ""
+                ),
+                "last_authenticated_region": most_recent_service.get(
+                    "LastAuthenticatedRegion", ""
+                ),
+            }
+        )
+    return principal_data
+
+
+@timeit
+def load_service_last_accessed_details(
+    neo4j_session: neo4j.Session,
+    principal_data: List[Dict],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        AWSPrincipalServiceAccessSchema(),
+        principal_data,
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
+    )
+
+
+def _role_unused_since_last_report(
+    role_last_used: Dict[str, datetime | None] | None,
+    arn: str,
+    last_authenticated: str | None,
+) -> bool:
+    """
+    A role's report only changes after the role is used again, so a role with no
+    RoleLastUsed (unused within IAM's tracking period) or none newer than its stored
+    access would get the same report. Comparing against the stored access rather
+    than the previous run means a report that lagged behind RoleLastUsed is
+    generated again next run.
+    """
+    if role_last_used is None or arn not in role_last_used:
+        return False
+    last_used = role_last_used[arn]
+    if last_used is None:
+        return True
+    if not last_authenticated:
+        return False
+    return last_used <= datetime.fromisoformat(last_authenticated)
+
+
+@timeit
+def sync_service_last_accessed_details(
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.session.Session,
+    current_aws_account_id: str,
+    aws_update_tag: int,
+    common_job_parameters: Dict,
+    role_last_used: Dict[str, datetime | None] | None = None,
+) -> None:
+    """
+    Sync service last accessed details for all principals in the account.
+
+    With `role_last_used` (role ARN to RoleLastUsed.LastUsedDate), roles with no
+    recorded use or none since their stored access are skipped: IAM throttles
+    report generation, and their report would not change.
+    """
+    logger.info(
+        "Syncing service last accessed details for account '%s'.",
+        current_aws_account_id,
+    )
+
+    principals_query = """
+    MATCH (account:AWSAccount{id: $AWS_ACCOUNT_ID})-[:RESOURCE]->(principal)
+    WHERE principal:AWSUser OR principal:AWSRole OR principal:AWSGroup
+    RETURN principal.arn AS arn, principal.last_authenticated AS last_authenticated
+    ORDER BY arn
+    """
+
+    results = neo4j_session.run(principals_query, AWS_ACCOUNT_ID=current_aws_account_id)
+    records = list(results)
+    principal_arns = [
+        record["arn"]
+        for record in records
+        if not _role_unused_since_last_report(
+            role_last_used, record["arn"], record["last_authenticated"]
+        )
+    ]
+
+    logger.info(
+        "Generating service last accessed reports for %d of %d principals; "
+        "the rest are roles not used since their stored access.",
+        len(principal_arns),
+        len(records),
+    )
+
+    principal_data: List[Dict] = []
+    for i in range(0, len(principal_arns), _SERVICE_LAST_ACCESSED_BATCH_SIZE):
+        batch = principal_arns[i : i + _SERVICE_LAST_ACCESSED_BATCH_SIZE]
+        # IAM runs first in an account's sync, so raising here would also skip
+        # every other resource in the account for want of this enrichment.
+        try:
+            service_details = get_service_last_accessed_details(boto3_session, batch)
+        except (
+            ClientError,
+            ConnectTimeoutError,
+            EndpointConnectionError,
+            ReadTimeoutError,
+        ) as e:
+            if isinstance(e, ClientError) and not _is_iam_throttling_error(e):
+                raise
+            logger.warning(
+                "Stopping service last accessed sync for account '%s' after %d of %d "
+                "principals; IAM stayed unavailable: %s",
+                current_aws_account_id,
+                i,
+                len(principal_arns),
+                e,
+            )
+            break
+        principal_data.extend(transform_service_last_accessed_details(service_details))
+
+    load_service_last_accessed_details(
+        neo4j_session,
+        principal_data,
+        current_aws_account_id,
+        aws_update_tag,
+    )
+
+    # Cleanup: Remove service access data from principals that weren't updated in this sync
+    GraphJob.from_node_schema(
+        AWSPrincipalServiceAccessSchema(), common_job_parameters
+    ).run(
+        neo4j_session,
     )
 
 
 @timeit
 def sync(
-    neo4j_session: neo4j.Session, boto3_session: boto3.session.Session, regions: List[str], current_aws_account_id: str,
-    update_tag: int, common_job_parameters: Dict,
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.Session,
+    regions: List[str],
+    current_aws_account_id: str,
+    update_tag: int,
+    common_job_parameters: Dict,
 ) -> None:
     logger.info("Syncing IAM for account '%s'.", current_aws_account_id)
     # This module only syncs IAM information that is in use.
     # As such only policies that are attached to a user, role or group are synced
-    sync_users(neo4j_session, boto3_session, current_aws_account_id, update_tag, common_job_parameters)
-    sync_groups(neo4j_session, boto3_session, current_aws_account_id, update_tag, common_job_parameters)
-    sync_roles(neo4j_session, boto3_session, current_aws_account_id, update_tag, common_job_parameters)
-    sync_group_memberships(neo4j_session, boto3_session, current_aws_account_id, update_tag, common_job_parameters)
-    sync_assumerole_relationships(neo4j_session, current_aws_account_id, update_tag, common_job_parameters)
-    sync_user_access_keys(neo4j_session, boto3_session, current_aws_account_id, update_tag, common_job_parameters)
-    run_cleanup_job('aws_import_principals_cleanup.json', neo4j_session, common_job_parameters)
+    sync_root_principal(
+        neo4j_session,
+        current_aws_account_id,
+        update_tag,
+        get_account_partition(regions, boto3_session.region_name),
+    )
+    # Users, groups and roles often share managed policies; resolve each one once.
+    policy_statement_cache: Dict[str, Any] = {}
+    authorization_details = get_account_authorization_details(
+        boto3_session, policy_statement_cache
+    )
+    sync_users(
+        neo4j_session,
+        boto3_session,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+        policy_statement_cache,
+        authorization_details,
+    )
+    sync_groups(
+        neo4j_session,
+        boto3_session,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+        policy_statement_cache,
+        authorization_details,
+    )
+    sync_roles(
+        neo4j_session,
+        boto3_session,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+        policy_statement_cache,
+        authorization_details,
+    )
+    # Sync service last accessed details after all principals (users, groups, roles) are synced
+    sync_service_last_accessed_details(
+        neo4j_session,
+        boto3_session,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+        role_last_used=(
+            authorization_details.role_last_used if authorization_details else None
+        ),
+    )
+    sync_assumerole_relationships(
+        neo4j_session,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+    sync_user_access_keys(
+        neo4j_session,
+        boto3_session,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+    # SAML providers are global (not region-scoped) for the account
+    saml_providers = get_saml_providers(boto3_session)
+    load_saml_providers(
+        neo4j_session,
+        saml_providers,
+        current_aws_account_id,
+        update_tag,
+    )
+    sync_server_certificates(
+        neo4j_session,
+        boto3_session,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+    sync_account_summary(
+        neo4j_session,
+        boto3_session,
+        current_aws_account_id,
+        update_tag,
+    )
+    cleanup_iam(neo4j_session, common_job_parameters)
+    merge_module_sync_metadata(
+        neo4j_session,
+        group_type="AWSAccount",
+        group_id=current_aws_account_id,
+        synced_type="AWSPrincipal",
+        update_tag=update_tag,
+        stat_handler=stat_handler,
+    )
+
+
+@timeit
+def get_account_from_arn(arn: str) -> str:
+    # ARN documentation
+    # https://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html
+
+    if not arn.startswith("arn:"):
+        # must be a service principal arn, such as ec2.amazonaws.com
+        return ""
+
+    parts = arn.split(":")
+    if len(parts) < 4:
+        return ""
+    else:
+        return parts[4]

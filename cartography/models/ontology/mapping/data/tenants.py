@@ -1,0 +1,1005 @@
+from cartography.models.ontology.mapping.specs import OntologyFieldMapping
+from cartography.models.ontology.mapping.specs import OntologyMapping
+from cartography.models.ontology.mapping.specs import OntologyNodeMapping
+
+# Tenant fields:
+# name - Display name or friendly name of the tenant/organization
+# status - Tenant lifecycle, normalized to the shared canonical set:
+#   active, suspended, pending_deletion, closed, unknown.
+#   The raw provider value stays on each source node's own state/status property.
+# domain - Primary domain name associated with the tenant
+
+# AWS Organizations account State/Status
+_AWS_ACCOUNT_STATUS = {
+    "ACTIVE": "active",
+    "PENDING_ACTIVATION": "unknown",
+    "SUSPENDED": "suspended",
+    "PENDING_CLOSURE": "pending_deletion",
+    "CLOSED": "closed",
+}
+
+# Azure SubscriptionState
+_AZURE_SUBSCRIPTION_STATUS = {
+    "Enabled": "active",
+    "Warned": "active",
+    "PastDue": "suspended",
+    "Disabled": "suspended",
+    "Deleted": "closed",
+}
+
+# DigitalOcean account status
+_DO_ACCOUNT_STATUS = {
+    "active": "active",
+    "warning": "active",
+    "locked": "suspended",
+}
+
+# GCP CRM state (v3 SDK emits State.<member>.name, e.g. "STATE_UNSPECIFIED")
+_GCP_LIFECYCLE_STATUS = {
+    "STATE_UNSPECIFIED": "unknown",
+    "ACTIVE": "active",
+    "DELETE_REQUESTED": "pending_deletion",
+    "DELETE_IN_PROGRESS": "pending_deletion",
+}
+
+# SentinelOne account state (mixed casing across the API/fixtures)
+_S1_ACCOUNT_STATUS = {
+    "Active": "active",
+    "active": "active",
+    "Expired": "suspended",
+    "Deleted": "closed",
+}
+
+# Sentry organization status (flattened status.name)
+_SENTRY_ORG_STATUS = {
+    "active": "active",
+    "pending_deletion": "pending_deletion",
+    "deletion_in_progress": "pending_deletion",
+}
+
+# OpenAI project status
+_OPENAI_PROJECT_STATUS = {
+    "active": "active",
+    "archived": "closed",
+}
+
+# Airbyte
+airbyte_mapping = OntologyMapping(
+    module_name="airbyte",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="AirbyteOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Anthropic: No field to map in AnthropicOrganization (minimal properties)
+
+# Opsgenie
+opsgenie_mapping = OntologyMapping(
+    module_name="opsgenie",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="OpsgenieAccount",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+            ],
+        ),
+    ],
+)
+
+# AWS
+aws_mapping = OntologyMapping(
+    module_name="aws",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="AWSAccount",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="state",
+                    special_handling="mapping",
+                    extra={"map": _AWS_ACCOUNT_STATUS},
+                ),
+                # domain: Not available
+            ],
+        ),
+        OntologyNodeMapping(
+            node_label="AWSOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="id", required=True
+                ),
+                # status: Not available; feature_set is not lifecycle state.
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Azure
+azure_mapping = OntologyMapping(
+    module_name="azure",
+    nodes=[
+        # AzureTenant has no mappable fields but the entry must exist so the
+        # _ont_source side-effect of _build_ontology_node_properties_statement
+        # fires for both AzureTenantSchema and the composite EntraTenantSchema
+        # (which carries `AzureTenant` as its primary label).
+        OntologyNodeMapping(node_label="AzureTenant", fields=[]),
+        OntologyNodeMapping(
+            node_label="AzureSubscription",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="state",
+                    special_handling="mapping",
+                    extra={"map": _AZURE_SUBSCRIPTION_STATUS},
+                ),
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Cloudflare
+cloudflare_mapping = OntologyMapping(
+    module_name="cloudflare",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="CloudflareAccount",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available (manages multiple domains)
+                # enabled: Not available
+            ],
+        ),
+    ],
+)
+
+# DigitalOcean
+digitalocean_mapping = OntologyMapping(
+    module_name="digitalocean",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="DOAccount",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="uuid", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="status",
+                    special_handling="mapping",
+                    extra={"map": _DO_ACCOUNT_STATUS},
+                ),
+                # domain: Not available
+            ],
+        ),
+        OntologyNodeMapping(
+            node_label="DOProject",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                )
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Entra (formerly Azure AD)
+entra_mapping = OntologyMapping(
+    module_name="microsoft",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="AzureTenant",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="display_name", required=True
+                ),
+                # status: intentionally not mapped. Entra's `state` field is a
+                # geographic province/region (part of the organization address
+                # block), not a tenant lifecycle status, so normalizing it would
+                # populate _ont_status with meaningless location strings.
+                # domain: Not available (multiple domains possible)
+            ],
+        ),
+    ],
+)
+
+# GCP
+gcp_mapping = OntologyMapping(
+    module_name="gcp",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="GCPOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="displayname", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="lifecyclestate",
+                    special_handling="mapping",
+                    extra={"map": _GCP_LIFECYCLE_STATUS},
+                ),
+                # domain: Not available
+            ],
+        ),
+        OntologyNodeMapping(
+            node_label="GCPProject",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="displayname", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="lifecyclestate",
+                    special_handling="mapping",
+                    extra={"map": _GCP_LIFECYCLE_STATUS},
+                ),
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# GitHub
+github_mapping = OntologyMapping(
+    module_name="github",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="GitHubOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="username", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Google Workspace
+googleworkspace_mapping = OntologyMapping(
+    module_name="googleworkspace",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="GoogleWorkspaceTenant",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(ontology_field="domain", node_field="domain"),
+                # status: Not available
+            ],
+        ),
+    ],
+)
+
+# GSuite (legacy): No field to map in GSuiteTenant (minimal properties)
+
+# Jamf: No field to map in JamfTenant (minimal properties)
+
+# Kandji: No field to map in KandjiTenant (minimal properties)
+
+
+# Keycloak
+keycloak_mapping = OntologyMapping(
+    module_name="keycloak",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="KeycloakRealm",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available (but enabled is available)
+                # domain: Not available (but domains tracked separately)
+            ],
+        ),
+    ],
+)
+
+# LastPass: No field to map in LastpassTenant (minimal properties)
+
+
+# Okta
+okta_mapping = OntologyMapping(
+    module_name="okta",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="OktaOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available (part of ID)
+            ],
+        ),
+    ],
+)
+
+# OpenAI
+# OpenAIOrganization: No field to map in OpenAIOrganization (minimal properties)
+openai_mapping = OntologyMapping(
+    module_name="openai",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="OpenAIProject",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="status",
+                    special_handling="mapping",
+                    extra={"map": _OPENAI_PROJECT_STATUS},
+                ),
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Scaleway
+# ScalewayOrganization: No field to map in ScalewayOrganization (minimal properties)
+scaleway_mapping = OntologyMapping(
+    module_name="scaleway",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="ScalewayProject",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+
+# Sentry
+sentry_mapping = OntologyMapping(
+    module_name="sentry",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="SentryOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="status",
+                    special_handling="mapping",
+                    extra={"map": _SENTRY_ORG_STATUS},
+                ),
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# SentinelOne
+sentinelone_mapping = OntologyMapping(
+    module_name="sentinelone",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="S1Account",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="state",
+                    special_handling="mapping",
+                    extra={"map": _S1_ACCOUNT_STATUS},
+                ),
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# SnipeIT: No field to map in SnipeITTenant (minimal properties)
+
+
+# Spacelift
+spacelift_mapping = OntologyMapping(
+    module_name="spacelift",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="SpaceliftAccount",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Slack
+slack_mapping = OntologyMapping(
+    module_name="slack",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="SlackTeam",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(ontology_field="domain", node_field="domain"),
+                # status: Not available
+            ],
+        ),
+    ],
+)
+
+# Notion
+notion_mapping = OntologyMapping(
+    module_name="notion",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="NotionWorkspace",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name",
+                    node_field="name",
+                    required=True,
+                ),
+            ],
+        ),
+    ],
+)
+
+# Duo
+# DuoApiHost: No field to map in DuoApiHost (minimal properties)
+
+# JumpCloud
+jumpcloud_mapping = OntologyMapping(
+    module_name="jumpcloud",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="JumpCloudTenant",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="id", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Tailscale
+# TailscaleTailnet: No field to map in TailscaleTailnet (minimal properties)
+
+
+# Tenable
+tenable_mapping = OntologyMapping(
+    module_name="tenable",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="TenableTenant",
+            # The configured ID may be an arbitrary scope identifier, so it is not
+            # normalized as a tenant name or domain.
+            fields=[],
+        ),
+    ],
+)
+
+
+# WorkOS Tenant mapping
+workos_tenants_mapping = OntologyMapping(
+    module_name="workos",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="WorkOSOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Available via WorkOSOrganizationDomain relationship
+            ],
+        ),
+    ],
+)
+
+
+# SubImage: SubImageTenant has no mappable Tenant fields; the entry exists
+# only so _ont_source is written on the node.
+subimage_mapping = OntologyMapping(
+    module_name="subimage",
+    nodes=[
+        OntologyNodeMapping(node_label="SubImageTenant", fields=[]),
+    ],
+)
+
+# Crowdstrike: CrowdstrikeTenant has no mappable Tenant fields; the entry
+# exists only so _ont_source is written on the node.
+crowdstrike_mapping = OntologyMapping(
+    module_name="crowdstrike",
+    nodes=[
+        OntologyNodeMapping(node_label="CrowdstrikeTenant", fields=[]),
+    ],
+)
+
+# Huntress account status
+_HUNTRESS_ACCOUNT_STATUS = {
+    "enabled": "active",
+    "disabled": "suspended",
+}
+
+# Huntress: the account is the billing and credential boundary, and each customer it
+# protects is an organization underneath it. Both are tenants.
+huntress_mapping = OntologyMapping(
+    module_name="huntress",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="HuntressAccount",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="status",
+                    special_handling="mapping",
+                    extra={"map": _HUNTRESS_ACCOUNT_STATUS},
+                ),
+                # domain: `subdomain` is a Huntress console subdomain rather than a
+                # domain the tenant owns, so it is not the canonical field.
+            ],
+        ),
+        OntologyNodeMapping(
+            node_label="HuntressOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: an organization has no lifecycle state in the API.
+            ],
+        ),
+    ],
+)
+
+# Socket.dev
+socketdev_mapping = OntologyMapping(
+    module_name="socketdev",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="SocketDevOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Salesforce
+salesforce_mapping = OntologyMapping(
+    module_name="salesforce",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="SalesforceOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Vercel
+vercel_mapping = OntologyMapping(
+    module_name="vercel",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="VercelTeam",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+# Netlify team lifecycle_state. Only "active" has been observed on a live team; the rest are
+# the states Netlify's billing flow can put a team into, mapped defensively so a suspended or
+# cancelled team does not silently land on a NULL _ont_status (the generated CASE has no ELSE).
+_NETLIFY_ACCOUNT_STATUS = {
+    "active": "active",
+    "trial": "active",
+    "trialing": "active",
+    "frozen": "suspended",
+    "suspended": "suspended",
+    "deactivated": "suspended",
+    "disabled": "suspended",
+    "pending_deletion": "pending_deletion",
+    "cancelled": "closed",
+    "canceled": "closed",
+    "closed": "closed",
+}
+
+netlify_mapping = OntologyMapping(
+    module_name="netlify",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="NetlifyAccount",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="lifecycle_state",
+                    special_handling="mapping",
+                    extra={"map": _NETLIFY_ACCOUNT_STATUS},
+                ),
+                # domain: a Netlify team has no domain of its own. Its sites do, and
+                # team_registration_domains is a list of email domains allowed to self-join,
+                # which is a different concept.
+            ],
+        ),
+    ],
+)
+
+# Railway has two tenancy levels, like GCP's Organization/Project: a workspace owns
+# projects, and every resource is scoped to a project.
+railway_mapping = OntologyMapping(
+    module_name="railway",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="RailwayWorkspace",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+        OntologyNodeMapping(
+            node_label="RailwayProject",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+circleci_mapping = OntologyMapping(
+    module_name="circleci",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="CircleCIOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+            ],
+        ),
+    ],
+)
+
+_SUPABASE_PROJECT_STATUS = {
+    "ACTIVE_HEALTHY": "active",
+    "ACTIVE_UNHEALTHY": "active",
+    "INACTIVE": "suspended",
+    "PAUSING": "suspended",
+    "PAUSE_FAILED": "suspended",
+    "GOING_DOWN": "suspended",
+    "REMOVED": "closed",
+    "COMING_UP": "unknown",
+    "INIT_FAILED": "unknown",
+    "RESTORING": "unknown",
+    "RESTORE_FAILED": "unknown",
+    "RESTARTING": "unknown",
+    "RESIZING": "unknown",
+    "UPGRADING": "unknown",
+    "UNKNOWN": "unknown",
+}
+
+
+supabase_mapping = OntologyMapping(
+    module_name="supabase",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="SupabaseOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available; the organization endpoints expose a plan
+                # but no lifecycle state.
+                # domain: Not available
+            ],
+        ),
+        OntologyNodeMapping(
+            node_label="SupabaseProject",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                OntologyFieldMapping(
+                    ontology_field="status",
+                    node_field="status",
+                    special_handling="mapping",
+                    extra={"map": _SUPABASE_PROJECT_STATUS},
+                ),
+                # domain: Not available. The project's *.supabase.co endpoint is
+                # modelled on SupabaseDatabase.host, and any custom domain gets
+                # its own SupabaseCustomHostname node.
+            ],
+        ),
+    ],
+)
+
+
+modal_mapping = OntologyMapping(
+    module_name="modal",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="ModalWorkspace",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Modal exposes no workspace lifecycle state.
+                # domain: a Modal workspace has a URL slug, not a domain.
+            ],
+        ),
+        OntologyNodeMapping(
+            node_label="ModalEnvironment",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: environments have no lifecycle state either.
+            ],
+        ),
+    ],
+)
+
+miradore_mapping = OntologyMapping(
+    module_name="miradore",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="MiradoreTenant",
+            fields=[
+                # The site name is the only identity Miradore exposes for a tenant.
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="id", required=True
+                ),
+                # status: Not available
+                # domain: Not available
+            ],
+        ),
+    ],
+)
+
+orca_mapping = OntologyMapping(
+    module_name="orca",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="OrcaOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+                # status: Not available
+                # domain: The regional API URL is not the organization's domain.
+            ],
+        ),
+    ],
+)
+
+zendesk_mapping = OntologyMapping(
+    module_name="zendesk",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="ZendeskTenant",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="id", required=True
+                ),
+                OntologyFieldMapping(ontology_field="domain", node_field="domain"),
+            ],
+        ),
+    ],
+)
+
+langsmith_mapping = OntologyMapping(
+    module_name="langsmith",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="LangSmithOrganization",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+            ],
+        ),
+        OntologyNodeMapping(
+            node_label="LangSmithWorkspace",
+            fields=[
+                OntologyFieldMapping(
+                    ontology_field="name", node_field="name", required=True
+                ),
+            ],
+        ),
+    ],
+)
+
+
+TENANTS_ONTOLOGY_MAPPING: dict[str, OntologyMapping] = {
+    "jira": OntologyMapping(
+        module_name="jira",
+        nodes=[
+            OntologyNodeMapping(
+                node_label="JiraTenant",
+                fields=[
+                    OntologyFieldMapping(
+                        ontology_field="name", node_field="name", required=True
+                    ),
+                    OntologyFieldMapping(ontology_field="domain", node_field="domain"),
+                ],
+            )
+        ],
+    ),
+    "zoom": OntologyMapping(
+        module_name="zoom",
+        nodes=[
+            OntologyNodeMapping(
+                node_label="ZoomAccount",
+                fields=[
+                    OntologyFieldMapping(
+                        ontology_field="name", node_field="id", required=True
+                    )
+                ],
+            )
+        ],
+    ),
+    "zendesk": zendesk_mapping,
+    "airbyte": airbyte_mapping,
+    "aws": aws_mapping,
+    "circleci": circleci_mapping,
+    "azure": azure_mapping,
+    "cloudflare": cloudflare_mapping,
+    "crowdstrike": crowdstrike_mapping,
+    "huntress": huntress_mapping,
+    "digitalocean": digitalocean_mapping,
+    "netlify": netlify_mapping,
+    "microsoft": entra_mapping,
+    "gcp": gcp_mapping,
+    "github": github_mapping,
+    "googleworkspace": googleworkspace_mapping,
+    "keycloak": keycloak_mapping,
+    "salesforce": salesforce_mapping,
+    "okta": okta_mapping,
+    "opsgenie": opsgenie_mapping,
+    "openai": openai_mapping,
+    "scaleway": scaleway_mapping,
+    "sentry": sentry_mapping,
+    "sentinelone": sentinelone_mapping,
+    "jumpcloud": jumpcloud_mapping,
+    "miradore": miradore_mapping,
+    "orca": orca_mapping,
+    "slack": slack_mapping,
+    "notion": notion_mapping,
+    "spacelift": spacelift_mapping,
+    "subimage": subimage_mapping,
+    "socketdev": socketdev_mapping,
+    "tenable": tenable_mapping,
+    "workos": workos_tenants_mapping,
+    "vercel": vercel_mapping,
+    "railway": railway_mapping,
+    "databricks": OntologyMapping(
+        module_name="databricks",
+        nodes=[
+            OntologyNodeMapping(
+                node_label="DatabricksWorkspace",
+                fields=[
+                    OntologyFieldMapping(
+                        ontology_field="name", node_field="host", required=True
+                    ),
+                    OntologyFieldMapping(ontology_field="domain", node_field="host"),
+                ],
+            ),
+            OntologyNodeMapping(
+                node_label="DatabricksAccount",
+                fields=[
+                    OntologyFieldMapping(
+                        ontology_field="name", node_field="account_id", required=True
+                    ),
+                    OntologyFieldMapping(ontology_field="domain", node_field="host"),
+                ],
+            ),
+        ],
+    ),
+    "supabase": supabase_mapping,
+    "modal": modal_mapping,
+    "snowflake": OntologyMapping(
+        module_name="snowflake",
+        nodes=[
+            OntologyNodeMapping(
+                node_label="SnowflakeAccount",
+                fields=[
+                    OntologyFieldMapping(
+                        ontology_field="name", node_field="name", required=True
+                    ),
+                    OntologyFieldMapping(
+                        ontology_field="domain", node_field="account_url"
+                    ),
+                    # status: Snowflake exposes no account lifecycle state. A
+                    # dropped account has `dropped_on` set, but that is a deletion
+                    # timestamp rather than the active/suspended/closed distinction
+                    # the canonical field carries, so it is left unmapped.
+                ],
+            ),
+            OntologyNodeMapping(
+                node_label="SnowflakeOrganization",
+                fields=[
+                    OntologyFieldMapping(
+                        ontology_field="name", node_field="name", required=True
+                    ),
+                ],
+            ),
+            OntologyNodeMapping(
+                node_label="SnowflakeManagedAccount",
+                fields=[
+                    OntologyFieldMapping(
+                        ontology_field="name", node_field="name", required=True
+                    ),
+                    OntologyFieldMapping(ontology_field="domain", node_field="url"),
+                ],
+            ),
+        ],
+    ),
+    "langsmith": langsmith_mapping,
+}

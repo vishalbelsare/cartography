@@ -215,4 +215,85 @@ DESCRIBE_SGS = [
         ],
         "VpcId": "vpc-05326141848d1c681",
     },
+    {
+        "Description": "web server security group",
+        "GroupName": "web-server-sg",
+        "IpPermissions": [
+            {
+                "FromPort": 22,
+                "IpProtocol": "tcp",
+                "IpRanges": [
+                    {
+                        "CidrIp": "10.0.0.0/8",
+                    },
+                ],
+                "Ipv6Ranges": [],
+                "PrefixListIds": [],
+                "ToPort": 22,
+                "UserIdGroupPairs": [
+                    {
+                        "GroupId": "sg-028e2522c72719996",
+                        "UserId": "000000000000",
+                    },
+                ],
+            },
+            {
+                "FromPort": 80,
+                "IpProtocol": "tcp",
+                "IpRanges": [
+                    {
+                        "CidrIp": "0.0.0.0/0",
+                    },
+                ],
+                "Ipv6Ranges": [],
+                "PrefixListIds": [],
+                "ToPort": 80,
+                "UserIdGroupPairs": [],
+            },
+            # The next two rules differ, yet their ports and protocol read
+            # "222222tcp" when written without separators.
+            {
+                "FromPort": 22,
+                "IpProtocol": "tcp",
+                "IpRanges": [
+                    {
+                        "CidrIp": "192.0.2.0/24",
+                    },
+                ],
+                "Ipv6Ranges": [],
+                "PrefixListIds": [],
+                "ToPort": 2222,
+                "UserIdGroupPairs": [],
+            },
+            {
+                "FromPort": 222,
+                "IpProtocol": "tcp",
+                "IpRanges": [
+                    {
+                        "CidrIp": "198.51.100.0/24",
+                    },
+                ],
+                "Ipv6Ranges": [],
+                "PrefixListIds": [],
+                "ToPort": 222,
+                "UserIdGroupPairs": [],
+            },
+        ],
+        "OwnerId": "000000000000",
+        "GroupId": "sg-web-server-12345",
+        "IpPermissionsEgress": [
+            {
+                "IpProtocol": "-1",
+                "IpRanges": [
+                    {
+                        "CidrIp": "0.0.0.0/0",
+                    },
+                ],
+                "Ipv6Ranges": [],
+                "PrefixListIds": [],
+                "UserIdGroupPairs": [],
+            },
+        ],
+        "VpcId": "vpc-05326141848d1c681",
+    },
 ]

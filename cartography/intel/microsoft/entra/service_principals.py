@@ -1,0 +1,304 @@
+import logging
+import re
+from typing import Any
+from typing import AsyncGenerator
+
+import neo4j
+from kiota_abstractions.api_error import APIError
+from msgraph import GraphServiceClient
+from msgraph.generated.models.service_principal import ServicePrincipal
+
+from cartography.analysis.microsoft.entra.analysis import ENTRA_APPLICATION_PROJECTION
+from cartography.client.core.tx import load
+from cartography.graph.job import GraphJob
+from cartography.intel.microsoft import credentials
+from cartography.intel.microsoft.entra.utils import call_with_retries
+from cartography.intel.microsoft.entra.utils import EMPTY_RISK
+from cartography.intel.microsoft.entra.utils import get_optional_id_map
+from cartography.intel.microsoft.entra.utils import transform_risk
+from cartography.models.microsoft.entra.service_principal import (
+    EntraServicePrincipalSchema,
+)
+from cartography.util import run_typed_analysis_job
+from cartography.util import timeit
+
+logger = logging.getLogger(__name__)
+
+SERVICE_PRINCIPALS_PAGE_SIZE = 999
+RISKY_SERVICE_PRINCIPALS_PERMISSION = (
+    "IdentityRiskyServicePrincipal.Read.All and Workload Identities Premium licensing"
+)
+
+
+@timeit
+async def get_entra_service_principals(
+    client: GraphServiceClient,
+) -> AsyncGenerator[ServicePrincipal, None]:
+    """
+    Gets Entra service principals using the Microsoft Graph API with a generator.
+
+    :param client: GraphServiceClient
+    :return: Generator of raw ServicePrincipal objects from Microsoft Graph
+    """
+    count = 0
+    # Get all service principals with pagination
+    request_configuration = client.service_principals.ServicePrincipalsRequestBuilderGetRequestConfiguration(
+        query_parameters=client.service_principals.ServicePrincipalsRequestBuilderGetQueryParameters(
+            top=SERVICE_PRINCIPALS_PAGE_SIZE
+        )
+    )
+    try:
+        page = await call_with_retries(
+            lambda: client.service_principals.get(
+                request_configuration=request_configuration,
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to fetch Entra service principals")
+        raise
+
+    while page:
+        if page.value:
+            for spn in page.value:
+                count += 1
+                yield spn
+
+        if not page.odata_next_link:
+            break
+        try:
+            page = await call_with_retries(
+                lambda: client.service_principals.with_url(page.odata_next_link).get(),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to fetch next page of Entra service principals",
+            )
+            raise
+
+    logger.debug("Retrieved %s Entra service principals total", count)
+
+
+async def get_service_principal_by_app_id(
+    client: GraphServiceClient, app_id: str
+) -> ServicePrincipal | None:
+    """
+    Gets a service principal by app_id using the Microsoft Graph API.
+    This function is extracted from the original app_role_assignments logic.
+
+    :param client: GraphServiceClient
+    :param app_id: Application ID to search for
+    :return: ServicePrincipal object or None if not found
+    """
+    service_principals_page = await call_with_retries(
+        lambda: client.service_principals.get(
+            request_configuration=client.service_principals.ServicePrincipalsRequestBuilderGetRequestConfiguration(
+                query_parameters=client.service_principals.ServicePrincipalsRequestBuilderGetQueryParameters(
+                    filter=f"appId eq '{app_id}'",
+                ),
+            ),
+        ),
+    )
+
+    if not service_principals_page or not service_principals_page.value:
+        logger.warning(
+            f"No service principal found for application {app_id}. Continuing."
+        )
+        return None
+
+    return service_principals_page.value[0]
+
+
+@timeit
+async def get_risky_service_principals(
+    client: GraphServiceClient,
+) -> dict[str, dict[str, Any]] | None:
+    """Return risk state keyed by service principal ID, or None when Graph denies or throttles it."""
+    builder = client.identity_protection.risky_service_principals
+    return await get_optional_id_map(
+        builder.get,
+        lambda url: builder.with_url(url).get(),
+        "risky service principals",
+        RISKY_SERVICE_PRINCIPALS_PERMISSION,
+        transform_risk,
+    )
+
+
+def transform_service_principals(
+    service_principals: list[ServicePrincipal],
+    risky_service_principals: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    # None means Graph denied the report; the flag keeps null risk readable as unknown.
+    risk_available = risky_service_principals is not None
+    risky_service_principals = risky_service_principals or {}
+    result = []
+    for spn in service_principals:
+        aws_identity_center_instance_id = None
+        match = re.search(r"d-[a-z0-9]{10}", spn.login_url or "")
+        aws_identity_center_instance_id = match.group(0) if match else None
+        transformed = {
+            "id": spn.id,
+            "app_id": spn.app_id,
+            "account_enabled": spn.account_enabled,
+            # uuid.UUID to string
+            "app_owner_organization_id": (
+                str(spn.app_owner_organization_id)
+                if spn.app_owner_organization_id
+                else None
+            ),
+            "aws_identity_center_instance_id": aws_identity_center_instance_id,
+            "display_name": spn.display_name,
+            "login_url": spn.login_url,
+            "preferred_single_sign_on_mode": spn.preferred_single_sign_on_mode,
+            "preferred_token_signing_key_thumbprint": spn.preferred_token_signing_key_thumbprint,
+            "reply_urls": spn.reply_urls,
+            "service_principal_type": spn.service_principal_type,
+            "sign_in_audience": spn.sign_in_audience,
+            "tags": spn.tags,
+            # uuid.UUID to string
+            "token_encryption_key_id": (
+                str(spn.token_encryption_key_id)
+                if spn.token_encryption_key_id
+                else None
+            ),
+            "risk_available": risk_available,
+            **risky_service_principals.get(spn.id or "", EMPTY_RISK),
+        }
+        result.append(transformed)
+    return result
+
+
+@timeit
+def load_service_principals(
+    neo4j_session: neo4j.Session,
+    service_principal_data: list[dict[str, Any]],
+    update_tag: int,
+    tenant_id: str,
+) -> None:
+    load(
+        neo4j_session,
+        EntraServicePrincipalSchema(),
+        service_principal_data,
+        lastupdated=update_tag,
+        TENANT_ID=tenant_id,
+    )
+
+
+@timeit
+def cleanup_service_principals(
+    neo4j_session: neo4j.Session, common_job_parameters: dict[str, Any]
+) -> None:
+    """
+    Delete Entra service principals from the graph if they were not updated in the last sync.
+
+    :param neo4j_session: Neo4j session
+    :param common_job_parameters: Common job parameters containing UPDATE_TAG and TENANT_ID
+    """
+    GraphJob.from_node_schema(EntraServicePrincipalSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+
+
+@timeit
+async def sync_service_principals(
+    neo4j_session: neo4j.Session,
+    tenant_id: str,
+    client_id: str | None,
+    client_secret: str | None,
+    update_tag: int,
+    common_job_parameters: dict[str, Any],
+    *,
+    delegated_auth: bool = False,
+    access_token: str | None = None,
+) -> None:
+    """
+    Sync Entra service principals to the graph.
+
+    :param neo4j_session: Neo4j session
+    :param tenant_id: Entra tenant ID
+    :param client_id: Azure application client ID
+    :param client_secret: Azure application client secret
+    :param update_tag: Update tag for tracking data freshness
+    :param common_job_parameters: Common job parameters for cleanup
+    :param delegated_auth: Use a user's identity and skip cleanup and analysis
+    :param access_token: Pre-issued Graph access token for delegated auth; the
+        current Azure CLI user is used when it is not set
+    """
+    # Create credentials and client
+    credential = credentials.make_credential(
+        tenant_id,
+        client_id,
+        client_secret,
+        delegated_auth=delegated_auth,
+        access_token=access_token,
+    )
+
+    client = GraphServiceClient(
+        credential,
+        scopes=["https://graph.microsoft.com/.default"],
+    )
+    risky_service_principals = await get_risky_service_principals(client)
+    service_principals_batch = []
+    batch_size = 50  # Batch size for service principals
+    total_count = 0
+
+    delegated_denial: APIError | None = None
+    try:
+        # Stream service principals and process in batches
+        async for spn in get_entra_service_principals(client):
+            service_principals_batch.append(spn)
+            total_count += 1
+
+            # Transform and load service principals in batches
+            if len(service_principals_batch) >= batch_size:
+                transformed_service_principals = transform_service_principals(
+                    service_principals_batch, risky_service_principals
+                )
+                load_service_principals(
+                    neo4j_session,
+                    transformed_service_principals,
+                    update_tag,
+                    tenant_id,
+                )
+                logger.debug(
+                    "Loaded batch of %s service principals (total: %s)",
+                    len(service_principals_batch),
+                    total_count,
+                )
+                service_principals_batch.clear()
+                transformed_service_principals.clear()
+    except APIError as error:
+        if not delegated_auth or error.response_status_code != 403:
+            raise
+        delegated_denial = error
+
+    # Process remaining service principals
+    if service_principals_batch:
+        transformed_service_principals = transform_service_principals(
+            service_principals_batch, risky_service_principals
+        )
+        load_service_principals(
+            neo4j_session, transformed_service_principals, update_tag, tenant_id
+        )
+        service_principals_batch.clear()
+        transformed_service_principals.clear()
+
+    if delegated_denial:
+        raise delegated_denial
+
+    if delegated_auth:
+        return
+
+    cleanup_service_principals(neo4j_session, common_job_parameters)
+
+    # Project `_ont_enabled` onto every EntraApplication from the linked
+    # service principal's `account_enabled`. Runs after cleanup so stale SPs
+    # are gone before we resolve enabled state, and so apps that lost their
+    # SP this sync get `_ont_enabled` reset to NULL rather than keeping a
+    # stale value from a prior run. Lives in the Entra path (not the
+    # ontology stage) so a `--selected-modules microsoft` sync still
+    # projects the field.
+    run_typed_analysis_job(
+        ENTRA_APPLICATION_PROJECTION,
+        neo4j_session,
+        common_job_parameters,
+    )

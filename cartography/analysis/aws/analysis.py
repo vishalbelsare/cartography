@@ -1,0 +1,575 @@
+from cartography.graph.analysis import AddRelationship
+from cartography.graph.analysis import AddToSet
+from cartography.graph.analysis import AnalysisJob
+from cartography.graph.analysis import AnalysisStatement
+from cartography.graph.analysis import Param
+from cartography.graph.analysis import RawCypher
+from cartography.graph.analysis import ScopeById
+from cartography.graph.analysis import SetProperties
+from cartography.graph.analysis import SetProperty
+from cartography.graph.analysis import Var
+
+AWS_EC2_IAM_INSTANCE_PROFILE = AnalysisJob(
+    name="EC2 Instances assume IAM roles",
+    short_name="aws_ec2_iaminstanceprofile",
+    scope=ScopeById("AWSAccount", "AWS_ID", scope_on="i"),
+    statements=(
+        AnalysisStatement(
+            match="MATCH (i:AWSEC2Instance)-[:INSTANCE_PROFILE]->(p:AWSInstanceProfile)-[:ASSOCIATED_WITH]->(r:AWSRole)",
+            effects=(
+                AddRelationship(
+                    "i",
+                    "STS_ASSUMEROLE_ALLOW",
+                    "r",
+                    rel_alias="s",
+                    source_label="AWSEC2Instance",
+                    target_label="AWSRole",
+                ),
+            ),
+        ),
+    ),
+)
+AWS_LAMBDA_ECR = AnalysisJob(
+    name="Lambda functions with ECR images",
+    short_name="aws_lambda_ecr",
+    statements=(
+        AnalysisStatement(
+            match="""
+            MATCH (lmbda:AWSLambda)
+            MATCH (e:AWSECRImage)
+            WHERE e.digest = 'sha256:' + lmbda.codesha256
+            """,
+            effects=(
+                AddRelationship(
+                    "lmbda",
+                    "HAS",
+                    "e",
+                    source_label="AWSLambda",
+                    target_label="AWSECRImage",
+                ),
+            ),
+        ),
+    ),
+)
+AWS_LB_IP_TARGET_EXPOSURE = AnalysisJob(
+    name="Resolve ELBV2 IP targets to private IP identities",
+    short_name="aws_lb_ip_target_exposure",
+    scope=ScopeById("AWSAccount", "AWS_ID", scope_on="lb"),
+    statements=(
+        AnalysisStatement(
+            comment="Resolve local/shared-VPC targets or explicit ECS service targets; skip ambiguous identities.",
+            # Expand only this balancer's registrations, not every target in the batch.
+            # Each registration must resolve to one ENI-specific IP identity; several
+            # candidates mean overlapping addresses remain ambiguous, not multiple targets.
+            match="""
+            MATCH (lb:AWSLoadBalancerV2)
+            UNWIND $IP_TARGETS_BY_LB[lb.id] AS target
+            MATCH (lb:AWSLoadBalancerV2 {id: target.LoadBalancerId})
+            CALL {
+                WITH target, lb
+                MATCH (ip:AWSEC2PrivateIp {private_ip_address: target.TargetId})
+                      <-[:PRIVATE_IP_ADDRESS]-(eni:AWSNetworkInterface)
+                      -[:PART_OF_SUBNET]->(subnet:AWSEC2Subnet)
+                WHERE subnet.vpc_id = target.VpcId AND eni.region = lb.region
+                RETURN ip
+                UNION
+                WITH target, lb
+                MATCH (:AWSELBV2TargetGroup {id: target.TargetGroupArn})
+                      -[:TARGETS]->(:AWSECSService)
+                      <-[:WORKLOAD_PARENT]-(:AWSECSTask)
+                      -[:NETWORK_INTERFACE]->(:AWSNetworkInterface)
+                      -[:PRIVATE_IP_ADDRESS]->(ip:AWSEC2PrivateIp {private_ip_address: target.TargetId})
+                RETURN ip
+            }
+            WITH lb, target, collect(DISTINCT ip) AS candidates
+            WHERE size(candidates) = 1
+            WITH lb, target, candidates[0] AS ip
+            """,
+            effects=(
+                AddRelationship(
+                    "lb",
+                    "EXPOSE",
+                    "ip",
+                    source_label="AWSLoadBalancerV2",
+                    target_label="AWSEC2PrivateIp",
+                    properties={
+                        "port": Var("target.Port"),
+                        "protocol": Var("target.Protocol"),
+                        "target_group_arn": Var("target.TargetGroupArn"),
+                        # Retain the legacy MatchLink ownership fields so its existing
+                        # edges participate in the same account-scoped cleanup.
+                        "_sub_resource_label": "AWSAccount",
+                        "_sub_resource_id": Param("AWS_ID"),
+                    },
+                    # Load batches without cleanup. Only a complete account inventory
+                    # enables cleanup, including edges written by the legacy MatchLink.
+                    cleanup_where="$CLEANUP_SAFE AND r._sub_resource_label = 'AWSAccount' AND r._sub_resource_id = $AWS_ID",
+                ),
+            ),
+        ),
+    ),
+)
+AWS_LB_CONTAINER_EXPOSURE = AnalysisJob(
+    name="AWS LoadBalancer to ECS Container direct relationship",
+    short_name="aws_lb_container_exposure",
+    # Runs in the cross-account analysis phase (after AWS_EC2_ASSET_EXPOSURE_JOBS compute
+    # lb.exposed_internet), so it is unscoped: AWS_ID is no longer in scope there. The
+    # AWSLoadBalancerV2/AWSECSContainer labels keep the global cleanup from touching the
+    # Kubernetes LB->container edges (KubernetesContainer is a :Container but not an :AWSECSContainer).
+    statements=(
+        AnalysisStatement(
+            match="MATCH (lb:AWSLoadBalancerV2 {exposed_internet: true})-[:EXPOSE]->(ip:AWSEC2PrivateIp)<-[:PRIVATE_IP_ADDRESS]-(ni:AWSNetworkInterface)<-[:NETWORK_INTERFACE]-(task:AWSECSTask)-[:HAS_CONTAINER]->(c:AWSECSContainer)",
+            effects=(
+                AddRelationship(
+                    "lb",
+                    "EXPOSE",
+                    "c",
+                    properties={"exposure_type": "via_lb_only"},
+                    source_label="AWSLoadBalancerV2",
+                    target_label="AWSECSContainer",
+                ),
+            ),
+        ),
+    ),
+)
+AWS_LB_NACL_DIRECT = AnalysisJob(
+    name="AWS LoadBalancer to NACL direct relationship",
+    short_name="aws_lb_nacl_direct",
+    scope=ScopeById("AWSAccount", "AWS_ID", scope_on="lb"),
+    statements=(
+        AnalysisStatement(
+            match="MATCH (lb:AWSLoadBalancerV2)-[:SUBNET]->(subnet:AWSEC2Subnet)<-[:PART_OF_SUBNET]-(nacl:AWSEC2NetworkAcl)",
+            effects=(
+                AddRelationship(
+                    "nacl",
+                    "PROTECTS",
+                    "lb",
+                    source_label="AWSEC2NetworkAcl",
+                    target_label="AWSLoadBalancerV2",
+                    scoped_to="target",
+                ),
+            ),
+        ),
+    ),
+)
+AWS_EC2_ASSET_EXPOSURE_LOAD_BALANCER_V2 = AnalysisJob(
+    name="AWS LoadBalancerV2 internet exposure",
+    short_name="aws_ec2_asset_exposure_load_balancer_v2",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            match="""
+            MATCH (elbv2:AWSLoadBalancerV2{scheme: 'internet-facing', type: 'network'})-[:ELBV2_LISTENER]->(:AWSELBV2Listener)
+            WITH DISTINCT elbv2
+            """,
+            effects=(
+                SetProperty(
+                    "elbv2", "exposed_internet", True, label="AWSLoadBalancerV2"
+                ),
+                SetProperty(
+                    "elbv2", "exposed_internet_type", None, label="AWSLoadBalancerV2"
+                ),
+            ),
+        ),
+        AnalysisStatement(
+            match="""
+            MATCH (cidr:AWSIpRange{range:'0.0.0.0/0'})-[:MEMBER_OF_IP_RULE]->(perm:AWSIpPermissionInbound)-[:MEMBER_OF_EC2_SECURITY_GROUP]->(sg:AWSEC2SecurityGroup)<-[:MEMBER_OF_EC2_SECURITY_GROUP]-(elbv2:AWSLoadBalancerV2{scheme: 'internet-facing'})-[:ELBV2_LISTENER]->(listener:AWSELBV2Listener)
+            WHERE perm.protocol = '-1' OR (listener.port>=perm.fromport AND listener.port<=perm.toport)
+            """,
+            effects=(
+                SetProperty(
+                    "elbv2", "exposed_internet", True, label="AWSLoadBalancerV2"
+                ),
+                SetProperty(
+                    "elbv2", "exposed_internet_type", None, label="AWSLoadBalancerV2"
+                ),
+            ),
+        ),
+    ),
+)
+AWS_EC2_ASSET_EXPOSURE_LOAD_BALANCER = AnalysisJob(
+    name="AWS LoadBalancer internet exposure",
+    short_name="aws_ec2_asset_exposure_load_balancer",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            match="""
+            MATCH (cidr:AWSIpRange{range:'0.0.0.0/0'})-[:MEMBER_OF_IP_RULE]->(perm:AWSIpPermissionInbound)-[:MEMBER_OF_EC2_SECURITY_GROUP]->(sg:AWSEC2SecurityGroup)<-[:SOURCE_SECURITY_GROUP]-(elb:AWSLoadBalancer{scheme: 'internet-facing'})-[:ELB_LISTENER]->(listener:AWSELBListener)
+            WHERE perm.protocol = '-1' OR (listener.port>=perm.fromport AND listener.port<=perm.toport)
+            """,
+            effects=(
+                SetProperty("elb", "exposed_internet", True, label="AWSLoadBalancer"),
+                SetProperty(
+                    "elb", "exposed_internet_type", None, label="AWSLoadBalancer"
+                ),
+            ),
+        ),
+    ),
+)
+AWS_EC2_ASSET_EXPOSURE_INSTANCE = AnalysisJob(
+    name="AWS EC2 instance internet exposure",
+    short_name="aws_ec2_asset_exposure_instance",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            match="""
+            MATCH (:AWSIpRange{id: '0.0.0.0/0'})-[:MEMBER_OF_IP_RULE]->(:AWSIpPermissionInbound)-[:MEMBER_OF_EC2_SECURITY_GROUP]->(:AWSEC2SecurityGroup)<-[:MEMBER_OF_EC2_SECURITY_GROUP|NETWORK_INTERFACE*..2]-(instance:AWSEC2Instance)
+            WHERE instance.publicipaddress IS NOT NULL
+            """,
+            effects=(
+                SetProperty(
+                    "instance", "exposed_internet", True, label="AWSEC2Instance"
+                ),
+                AddToSet(
+                    "instance",
+                    "exposed_internet_type",
+                    "direct",
+                    label="AWSEC2Instance",
+                ),
+            ),
+        ),
+        AnalysisStatement(
+            match="MATCH (:AWSLoadBalancer{exposed_internet: true})-[:EXPOSE]->(e:AWSEC2Instance)",
+            effects=(
+                SetProperty("e", "exposed_internet", True, label="AWSEC2Instance"),
+                AddToSet("e", "exposed_internet_type", "elb", label="AWSEC2Instance"),
+            ),
+        ),
+        AnalysisStatement(
+            match="MATCH (:AWSLoadBalancerV2{exposed_internet: true})-[:EXPOSE]->(e:AWSEC2Instance)",
+            effects=(
+                SetProperty("e", "exposed_internet", True, label="AWSEC2Instance"),
+                AddToSet("e", "exposed_internet_type", "elbv2", label="AWSEC2Instance"),
+            ),
+        ),
+    ),
+)
+AWS_EC2_ASSET_EXPOSURE_AUTO_SCALING_GROUP = AnalysisJob(
+    name="AWS Auto Scaling group internet exposure",
+    short_name="aws_ec2_asset_exposure_auto_scaling_group",
+    cleanup_iterationsize=1000,
+    statements=(
+        AnalysisStatement(
+            match="""
+            MATCH (instance:AWSEC2Instance{exposed_internet: true})-[:MEMBER_AUTO_SCALE_GROUP]->(asg:AWSAutoScalingGroup)
+            UNWIND instance.exposed_internet_type as type
+            WITH DISTINCT type, asg
+            """,
+            effects=(
+                SetProperty(
+                    "asg", "exposed_internet", True, label="AWSAutoScalingGroup"
+                ),
+                AddToSet(
+                    "asg",
+                    "exposed_internet_type",
+                    Var("type"),
+                    label="AWSAutoScalingGroup",
+                ),
+            ),
+        ),
+    ),
+)
+AWS_EC2_ASSET_EXPOSURE_JOBS = (
+    AWS_EC2_ASSET_EXPOSURE_LOAD_BALANCER_V2,
+    AWS_EC2_ASSET_EXPOSURE_LOAD_BALANCER,
+    AWS_EC2_ASSET_EXPOSURE_INSTANCE,
+    AWS_EC2_ASSET_EXPOSURE_AUTO_SCALING_GROUP,
+)
+AWS_EC2_KEYPAIR_PROPERTIES = AnalysisJob(
+    name="Analysis jobs for EC2 Key Pairs properties",
+    short_name="aws_ec2_keypair_analysis_properties",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (k:AWSEC2KeyPair) WHERE size(k.keyfingerprint) = 47",
+            effects=(SetProperty("k", "user_uploaded", True, label="AWSEC2KeyPair"),),
+        ),
+        AnalysisStatement(
+            match="MATCH (k1:AWSEC2KeyPair) MATCH (k2:AWSEC2KeyPair) WHERE id(k1) < id(k2) AND k1.keyfingerprint = k2.keyfingerprint",
+            effects=(
+                SetProperty(
+                    "k1", "duplicate_keyfingerprint", True, label="AWSEC2KeyPair"
+                ),
+                SetProperty(
+                    "k2", "duplicate_keyfingerprint", True, label="AWSEC2KeyPair"
+                ),
+            ),
+        ),
+    ),
+)
+AWS_EC2_KEYPAIR_MATCHING_FINGERPRINT = AnalysisJob(
+    name="Analysis jobs for EC2 Key Pairs matching fingerprints",
+    short_name="aws_ec2_keypair_analysis_matching_fingerprint",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (k1:AWSEC2KeyPair) MATCH (k2:AWSEC2KeyPair) WHERE id(k1) < id(k2) AND k1.keyfingerprint = k2.keyfingerprint",
+            effects=(
+                AddRelationship(
+                    "k1",
+                    "MATCHING_FINGERPRINT",
+                    "k2",
+                    undirected=True,
+                    source_label="AWSEC2KeyPair",
+                    target_label="AWSEC2KeyPair",
+                    firstseen=Param("UPDATE_TAG"),
+                ),
+            ),
+        ),
+    ),
+)
+AWS_EC2_KEYPAIR_ANALYSIS_JOBS = (
+    AWS_EC2_KEYPAIR_PROPERTIES,
+    AWS_EC2_KEYPAIR_MATCHING_FINGERPRINT,
+)
+AWS_EKS_ASSET_EXPOSURE = AnalysisJob(
+    name="AWS EKS internet exposure",
+    short_name="aws_eks_asset_exposure",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (cluster:AWSEKSCluster) WHERE cluster.endpoint_public_access = true",
+            effects=(
+                SetProperty("cluster", "exposed_internet", True, label="AWSEKSCluster"),
+            ),
+        ),
+    ),
+)
+AWS_FOREIGN_ACCOUNTS = AnalysisJob(
+    name="AWS - Foreign account analysis",
+    short_name="aws_foreign_accounts",
+    statements=(
+        AnalysisStatement(
+            match="MATCH (foreign:AWSAccount) where foreign.inscope IS NULL",
+            effects=(SetProperty("foreign", "foreign", True, label="AWSAccount"),),
+        ),
+    ),
+)
+AWS_ECS_ASSET_EXPOSURE = AnalysisJob(
+    name="AWS ECS internet exposure",
+    short_name="aws_ecs_asset_exposure",
+    cleanup_iterationsize=1000,
+    statements=(
+        # Exposed via an internet-facing load balancer.
+        AnalysisStatement(
+            match="""
+            MATCH (lb:AWSLoadBalancerV2 {exposed_internet: true})-[:EXPOSE]->(ip:AWSEC2PrivateIp)<-[:PRIVATE_IP_ADDRESS]-(ni:AWSNetworkInterface)<-[:NETWORK_INTERFACE]-(task:AWSECSTask)-[:HAS_CONTAINER]->(container:AWSECSContainer)
+            WITH DISTINCT container
+            """,
+            effects=(
+                SetProperty(
+                    "container", "exposed_internet", True, label="AWSECSContainer"
+                ),
+                AddToSet(
+                    "container",
+                    "exposed_internet_type",
+                    "elbv2",
+                    label="AWSECSContainer",
+                ),
+            ),
+        ),
+        # Directly exposed: the ECS task's ENI (any awsvpc-networked task, Fargate or EC2 launch
+        # type) has a public IP and a security group that allows inbound from 0.0.0.0/0. Mirrors the
+        # AWSEC2Instance "direct" exposure statement.
+        AnalysisStatement(
+            match="""
+            MATCH (:AWSIpRange {id: '0.0.0.0/0'})-[:MEMBER_OF_IP_RULE]->(:AWSIpPermissionInbound)-[:MEMBER_OF_EC2_SECURITY_GROUP]->(:AWSEC2SecurityGroup)<-[:MEMBER_OF_EC2_SECURITY_GROUP]-(ni:AWSNetworkInterface)<-[:NETWORK_INTERFACE]-(task:AWSECSTask)-[:HAS_CONTAINER]->(container:AWSECSContainer)
+            WHERE ni.public_ip IS NOT NULL
+            WITH DISTINCT container
+            """,
+            effects=(
+                SetProperty(
+                    "container", "exposed_internet", True, label="AWSECSContainer"
+                ),
+                AddToSet(
+                    "container",
+                    "exposed_internet_type",
+                    "direct",
+                    label="AWSECSContainer",
+                ),
+            ),
+        ),
+    ),
+)
+# The IDs of the accounts with a load balancer interface, an AWSNetworkInterface that
+# amazon-elb requested, that another load balancer reaches as an IP target, directly
+# or chained through an alb target group. This is the static IP pattern for an ALB,
+# where an NLB's IP target group lists the ALB's private IPs. The graph does not link
+# those interfaces to their load balancer, so every internal load balancer in the
+# account may be the one behind it. The front load balancer counts when it is not
+# internal, or belongs to another account whatever its scheme, since judging that one
+# would take the same rule for its own account's interfaces, and so on. An internal
+# one in the same account does not count: what reaches it is one of the account's
+# entry points, which its check counts, one of its interfaces, which this rule
+# covers, or a load balancer chained in front of it, which counts here.
+# The rule spans accounts, so it is evaluated when results are written, not in the
+# account check, and a load balancer synced with another account counts as soon as
+# it is in the graph, whichever account synced first. A statement evaluates it once,
+# as `fronted_accounts`, for AWS_LB_MAY_FACE_INTERNET to read.
+AWS_LB_INTERFACE_FRONTED_ACCOUNTS = """COLLECT {
+    MATCH (account:AWSAccount)-[:RESOURCE]->(:AWSNetworkInterface {requester_id: 'amazon-elb'})
+        -[:PRIVATE_IP_ADDRESS]->(:AWSEC2PrivateIp)<-[:EXPOSE*1..2]-(front:AWSLoadBalancerV2)
+    WHERE coalesce(front.scheme, '') <> 'internal'
+    OR NOT EXISTS { MATCH (account)-[:RESOURCE]->(front) }
+    RETURN DISTINCT account.id
+}"""
+# A Cypher predicate on `lb`, which needs `fronted_accounts` bound to
+# AWS_LB_INTERFACE_FRONTED_ACCOUNTS. A load balancer may face the internet unless it
+# is internal, its account was checked for unmodeled internet paths, with none found,
+# at or after the load balancer's own sync, and no load balancer that may face the
+# internet reaches the account's load balancer interfaces. An account that was never
+# checked, or whose check is older than the load balancer, counts as unknown rather
+# than clear.
+AWS_LB_MAY_FACE_INTERNET = """(
+    coalesce(lb.scheme, '') <> 'internal'
+    OR NOT EXISTS {
+        MATCH (lb)<-[:RESOURCE]-(lb_account:AWSAccount)
+        WHERE lb_account.unmodeled_internet_paths_checked_at >= lb.lastupdated
+        AND lb_account.unmodeled_internet_path_count = 0
+        AND NOT lb_account.id IN fronted_accounts
+    }
+)"""
+# Internet entry points whose onward path the graph does not model, because they
+# terminate on private addresses: CloudFront VPC origins, API Gateway REST VPC links,
+# and any API Gateway v2 API, since v2 VPC link integrations are not ingested. Every
+# checked account records the result, including a count of 0, so readers can tell a
+# clear account from one that was never checked. An account's sync runs the job with
+# $CHECK_INPUTS_SYNCED false before it loads any of the check's inputs: nothing is
+# written and the stamped cleanup withdraws the account's previous result. It runs it
+# again with true after them only when it synced all of them, so a sync that fails
+# part-way leaves the account unchecked.
+AWS_UNMODELED_INTERNET_PATHS = AnalysisJob(
+    name="AWS unmodeled internet paths",
+    short_name="aws_unmodeled_internet_paths",
+    scope=ScopeById("AWSAccount", "AWS_ID", scope_on="account"),
+    statements=(
+        AnalysisStatement(
+            match="""
+            MATCH (account:AWSAccount)
+            WHERE $CHECK_INPUTS_SYNCED
+            WITH account,
+                COLLECT {
+                    MATCH (account)-[:RESOURCE]->(distribution:AWSCloudFrontDistribution)
+                    WHERE size(coalesce(distribution.vpc_origin_ids, [])) > 0
+                    RETURN distribution.id ORDER BY distribution.id
+                } + COLLECT {
+                    MATCH (account)-[:RESOURCE]->(integration:AWSAPIGatewayIntegration)
+                    WHERE integration.connection_type = 'VPC_LINK'
+                    RETURN integration.id ORDER BY integration.id
+                } + COLLECT {
+                    MATCH (account)-[:RESOURCE]->(api:AWSAPIGatewayV2API)
+                    RETURN api.id ORDER BY api.id
+                } AS paths
+            """,
+            effects=(
+                SetProperties(
+                    "account",
+                    {
+                        "unmodeled_internet_paths": RawCypher(
+                            "CASE WHEN size(paths) > 0 THEN paths[..10] END"
+                        ),
+                        "unmodeled_internet_path_count": RawCypher("size(paths)"),
+                        "unmodeled_internet_paths_checked_at": Param("UPDATE_TAG"),
+                    },
+                    label="AWSAccount",
+                    cleanup_stamp="unmodeled_internet_paths_checked_at",
+                ),
+            ),
+        ),
+    ),
+)
+# The job checks a task when its account was checked for unmodeled internet paths in
+# the run that synced the task, whatever the check found, its task definition is in
+# the graph, and, for an awsvpc task, its interfaces are. The account check must come
+# from the task's own run: it vouches for the account's load balancers and interfaces,
+# and only the ECS sync links a new target group to the task's service. Every task it
+# checks, and its containers, get no_modeled_internet_path, true or false, stamped
+# with the run's tag, so a reader can tell a declined task from one that was not
+# checked. A task it cannot check gets neither, and loses any earlier result.
+#
+# A task has no modeled internet path when its account's check found none, it is
+# awsvpc, no interface it uses has a public IPv4 or any IPv6 address, and every load
+# balancer that reaches it, directly, through a target group on its service, or
+# chained behind another load balancer, is internal in a checked, clear account.
+# Bridge and host tasks share the instance's network, and a task definition without a
+# network mode uses bridge. An Elastic IP linked to an interface counts as a public
+# IPv4 address, because the Elastic IP sync can link one in a run that does not
+# refresh the interface's public_ip. The task is matched to its service by name, not
+# WORKLOAD_PARENT: the ECS sync loads tasks before services, so the tasks of a new
+# service get that edge a run later.
+#
+# The job re-checks every task in the graph on every AWS run, not only the ones this
+# run synced: a load balancer synced with another account can reach a task, accounts
+# may be synced by separate runs, and a partial run can make an earlier result stale.
+# Results are replaced, not cleared first, so a reader keeps the previous result until
+# this run decides.
+AWS_ECS_NO_MODELED_INTERNET_PATH = AnalysisJob(
+    name="AWS ECS no modeled internet path",
+    short_name="aws_ecs_no_modeled_internet_path",
+    statements=(
+        AnalysisStatement(
+            match="""
+            WITH """
+            + AWS_LB_INTERFACE_FRONTED_ACCOUNTS
+            + """ AS fronted_accounts
+            MATCH (account:AWSAccount)-[:RESOURCE]->(task:AWSECSTask)
+                -[:HAS_TASK_DEFINITION]->(definition:AWSECSTaskDefinition)
+            WHERE account.unmodeled_internet_paths_checked_at = task.lastupdated
+            AND (
+                coalesce(definition.network_mode, '') <> 'awsvpc'
+                OR EXISTS { MATCH (task)-[:NETWORK_INTERFACE]->(:AWSNetworkInterface) }
+            )
+            WITH task,
+                account.unmodeled_internet_path_count = 0
+                AND coalesce(definition.network_mode, '') = 'awsvpc'
+                AND NOT EXISTS {
+                    MATCH (task)-[:NETWORK_INTERFACE]->(eni:AWSNetworkInterface)
+                    WHERE eni.public_ip IS NOT NULL
+                    OR size(coalesce(eni.ipv6_addresses, [])) > 0
+                    OR EXISTS {
+                        MATCH (eni)-[:PRIVATE_IP_ADDRESS]->(address:AWSEC2PrivateIp)
+                        WHERE address.public_ip IS NOT NULL
+                    }
+                    OR EXISTS { MATCH (eni)-[:ELASTIC_IP_ADDRESS]->(:AWSElasticIPAddress) }
+                }
+                AND NOT EXISTS {
+                    MATCH (exposed:AWSECSContainer)-[:WORKLOAD_PARENT]->(task)
+                    WHERE exposed.exposed_internet = true
+                }
+                AND NOT EXISTS {
+                    MATCH (task)-[:NETWORK_INTERFACE]->(:AWSNetworkInterface)
+                        -[:PRIVATE_IP_ADDRESS]->(:AWSEC2PrivateIp)<-[:EXPOSE*1..2]-(lb:AWSLoadBalancerV2)
+                    WHERE """
+            + AWS_LB_MAY_FACE_INTERNET
+            + """
+                }
+                AND NOT EXISTS {
+                    MATCH (:AWSECSService {cluster_arn: task.cluster_arn, name: task.service_name})
+                        <-[:TARGETS]-(:AWSELBV2TargetGroup)
+                        <-[:ELBV2_TARGET_GROUP]-(:AWSLoadBalancerV2)<-[:EXPOSE*0..1]-(lb:AWSLoadBalancerV2)
+                    WHERE """
+            + AWS_LB_MAY_FACE_INTERNET
+            + """
+                } AS clear
+            OPTIONAL MATCH (container:AWSECSContainer)-[:WORKLOAD_PARENT]->(task)
+            """,
+            effects=(
+                SetProperties(
+                    "task",
+                    {
+                        "no_modeled_internet_path": Var("clear"),
+                        "no_modeled_internet_path_checked_at": Param("UPDATE_TAG"),
+                    },
+                    label="AWSECSTask",
+                    cleanup_stamp="no_modeled_internet_path_checked_at",
+                ),
+                SetProperties(
+                    "container",
+                    {
+                        "no_modeled_internet_path": Var("clear"),
+                        "no_modeled_internet_path_checked_at": Param("UPDATE_TAG"),
+                    },
+                    label="AWSECSContainer",
+                    cleanup_stamp="no_modeled_internet_path_checked_at",
+                ),
+            ),
+        ),
+    ),
+)

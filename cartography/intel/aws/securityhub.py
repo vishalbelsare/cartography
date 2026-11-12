@@ -1,20 +1,24 @@
-import datetime
 import logging
-from typing import Dict
-from typing import List
+from typing import Any
 
 import boto3
 import neo4j
+from dateutil import parser
 
-from cartography.util import run_cleanup_job
+from cartography.client.core.tx import load
+from cartography.graph.job import GraphJob
+from cartography.intel.aws.util.botocore_config import create_boto3_client
+from cartography.models.aws.securityhub import SecurityHubSchema
+from cartography.util import aws_handle_regions
 from cartography.util import timeit
 
 logger = logging.getLogger(__name__)
 
 
 @timeit
-def get_hub(boto3_session: boto3.session.Session) -> Dict:
-    client = boto3_session.client('securityhub')
+@aws_handle_regions
+def get_hub(boto3_session: boto3.session.Session) -> dict:
+    client = create_boto3_client(boto3_session, "securityhub")
     try:
         return client.describe_hub()
     except client.exceptions.ResourceNotFoundException:
@@ -23,50 +27,48 @@ def get_hub(boto3_session: boto3.session.Session) -> Dict:
         return {}
 
 
-def transform_hub(hub_data: Dict) -> None:
-    if 'SubscribedAt' in hub_data and hub_data['SubscribedAt']:
-        subbed_at = datetime.datetime.strptime(hub_data['SubscribedAt'], "%Y-%m-%dT%H:%M:%S.%fZ")
-        hub_data['SubscribedAt'] = int(subbed_at.timestamp())
+def transform_hub(hub_data: dict) -> None:
+    if "SubscribedAt" in hub_data and hub_data["SubscribedAt"]:
+        subbed_at = parser.parse(hub_data["SubscribedAt"])
+        hub_data["SubscribedAt"] = int(subbed_at.timestamp())
     else:
-        hub_data['SubscribedAt'] = None
+        hub_data["SubscribedAt"] = None
 
 
 @timeit
 def load_hub(
     neo4j_session: neo4j.Session,
-    data: Dict,
+    data: dict[str, Any],
     current_aws_account_id: str,
     aws_update_tag: int,
 ) -> None:
-    ingest_hub = """
-    WITH {Hub} AS hub
-    MERGE (n:SecurityHub{id: hub.HubArn})
-    ON CREATE SET n.firstseen = timestamp()
-    SET n.subscribed_at = hub.SubscribedAt, n.auto_enable_controls = hub.AutoEnableControls,
-        n.lastupdated = {aws_update_tag}
-    WITH n
-    MATCH (owner:AWSAccount{id: {AWS_ACCOUNT_ID}})
-    MERGE (owner)-[r:RESOURCE]->(n)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {aws_update_tag}
-    """
-    neo4j_session.run(
-        ingest_hub,
-        Hub=data,
-        AWS_ACCOUNT_ID=current_aws_account_id,
-        aws_update_tag=aws_update_tag,
+    load(
+        neo4j_session,
+        SecurityHubSchema(),
+        [data],
+        lastupdated=aws_update_tag,
+        AWS_ID=current_aws_account_id,
     )
 
 
 @timeit
-def cleanup_securityhub(neo4j_session: neo4j.Session, common_job_parameters: Dict) -> None:
-    run_cleanup_job('aws_import_securityhub_cleanup.json', neo4j_session, common_job_parameters)
+def cleanup_securityhub(
+    neo4j_session: neo4j.Session,
+    common_job_parameters: dict,
+) -> None:
+    GraphJob.from_node_schema(SecurityHubSchema(), common_job_parameters).run(
+        neo4j_session,
+    )
 
 
 @timeit
 def sync(
-    neo4j_session: neo4j.Session, boto3_session: boto3.session.Session, regions: List[str], current_aws_account_id: str,
-    update_tag: int, common_job_parameters: Dict,
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.session.Session,
+    regions: list[str],
+    current_aws_account_id: str,
+    update_tag: int,
+    common_job_parameters: dict,
 ) -> None:
     logger.info("Syncing Security Hub in account '%s'.", current_aws_account_id)
     hub = get_hub(boto3_session)

@@ -1,19 +1,39 @@
-FROM ubuntu:bionic
+# Base image
+FROM python:3.13.14-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS base
+# Default to ''. Overridden with a specific version specifier e.g. '==0.98.0' by build args or from GitHub actions.
+ARG VERSION_SPECIFIER
+# the UID and GID to run cartography as
+# (https://github.com/hexops/dockerfile#do-not-use-a-uid-below-10000).
+ARG uid=10001
+ARG gid=10001
+USER ${uid}:${gid}
+WORKDIR /var/cartography
+ENV HOME=/var/cartography
 
-WORKDIR /srv/cartography
 
-ENV PATH=/venv/bin:$PATH
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev python3-pip python3-setuptools openssl libssl-dev gcc pkg-config libffi-dev libxml2-dev libxmlsec1-dev && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
 
-COPY . /srv/cartography
+# Intermediate image to build the venv
+FROM base AS builder
+# Install uv version 0.7.3
+COPY --from=ghcr.io/astral-sh/uv@sha256:87a04222b228501907f487b338ca6fc1514a93369bfce6930eb06c8d576e58a4 /uv /uvx /bin/
+# Install cartography
+RUN ls -alh /var/cartography
+# The neo4j-rust extra swaps in Neo4j's Rust Bolt codec, worth ~20-30% off sync time.
+# It is an extra rather than a hard dependency because a platform without a pre-built
+# wheel would have to build it from source, which needs a Rust toolchain. That is not a
+# concern here: the linux/amd64 and linux/arm64 images this Dockerfile targets are both
+# covered by manylinux wheels.
+RUN uv tool install "cartography[neo4j-rust]${VERSION_SPECIFIER}"
+RUN ls -alh /var/cartography
 
-RUN pip3 install -e . && \
-    pip3 install -r test-requirements.txt
 
-RUN groupadd cartography && \
-    useradd -s /bin/bash -d /home/cartography -m -g cartography cartography
+# Final production image
+FROM base AS production
+# Copy venv from the builder stage
+COPY --from=builder --chown=${uid}:${gid} /var/cartography/.local /var/cartography/.local
+ENV PATH="/var/cartography/.local/bin:$PATH"
+# verify that the binary at least runs
+RUN cartography -h
 
-USER cartography
+ENTRYPOINT ["cartography"]
+CMD ["-h"]

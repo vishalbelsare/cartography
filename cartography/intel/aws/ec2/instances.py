@@ -1,307 +1,705 @@
 import logging
 import time
+from collections import namedtuple
+from typing import Any
 from typing import Dict
 from typing import List
+from typing import Optional
 
 import boto3
 import neo4j
 
-from .util import get_botocore_config
+from cartography.client.core.tx import load
+from cartography.client.core.tx import load_matchlinks
+from cartography.graph.job import GraphJob
+from cartography.intel.aws.util.arns import get_partition
+from cartography.intel.aws.util.botocore_config import create_boto3_client
+from cartography.intel.aws.util.botocore_config import get_botocore_config
+from cartography.models.aws.ec2.auto_scaling_groups import (
+    EC2InstanceAutoScalingGroupSchema,
+)
+from cartography.models.aws.ec2.filesystem_snapshot import EC2FilesystemSnapshotSchema
+from cartography.models.aws.ec2.instances import EC2InstanceSchema
+from cartography.models.aws.ec2.instances import EC2InstanceToRoleAssumesMatchLink
+from cartography.models.aws.ec2.ipv6_addresses import EC2Ipv6AddressSchema
+from cartography.models.aws.ec2.keypair_instance import EC2KeyPairInstanceSchema
+from cartography.models.aws.ec2.networkinterface_instance import (
+    EC2NetworkInterfaceInstanceSchema,
+)
+from cartography.models.aws.ec2.reservations import EC2ReservationSchema
+from cartography.models.aws.ec2.securitygroup_instance import (
+    EC2SecurityGroupInstanceSchema,
+)
+from cartography.models.aws.ec2.subnet_instance import EC2SubnetInstanceSchema
+from cartography.models.aws.ec2.volumes import EBSVolumeInstanceSchema
 from cartography.util import aws_handle_regions
-from cartography.util import run_cleanup_job
 from cartography.util import timeit
 
 logger = logging.getLogger(__name__)
 
 
+Ec2Data = namedtuple(
+    "Ec2Data",
+    [
+        "reservation_list",
+        "instance_list",
+        "subnet_list",
+        "sg_list",
+        "keypair_list",
+        "network_interface_list",
+        "instance_ebs_volumes_list",
+        "ipv6_address_list",
+        "filesystem_snapshot_list",
+    ],
+)
+
+
+def _get_eks_cluster_name(tags: List[Dict[str, str]]) -> Optional[str]:
+    for tag in tags:
+        key = tag.get("Key")
+        value = tag.get("Value")
+
+        if key == "eks:cluster-name" and value:
+            return value
+
+        if key == "alpha.eksctl.io/cluster-name" and value:
+            return value
+
+        if key and key.startswith("kubernetes.io/cluster/"):
+            cluster_name = key.split("kubernetes.io/cluster/")[-1]
+            if cluster_name:
+                return cluster_name
+
+    return None
+
+
+def _transform_metadata_options(metadata_options: Dict[str, Any]) -> Dict[str, Any]:
+    http_tokens = metadata_options.get("HttpTokens")
+    if http_tokens == "required":
+        imds_access_mode = "v2_only"
+    elif http_tokens == "optional":
+        imds_access_mode = "v1_or_v2"
+    else:
+        imds_access_mode = None
+
+    return {
+        "MetadataHttpTokens": http_tokens,
+        "MetadataHttpPutResponseHopLimit": metadata_options.get(
+            "HttpPutResponseHopLimit",
+        ),
+        "MetadataHttpEndpoint": metadata_options.get("HttpEndpoint"),
+        "MetadataHttpProtocolIpv6": metadata_options.get("HttpProtocolIpv6"),
+        "MetadataInstanceTags": metadata_options.get("InstanceMetadataTags"),
+        "ImdsAccessMode": imds_access_mode,
+        "ImdsV1Enabled": http_tokens == "optional" if http_tokens else None,
+        "ImdsV2Required": http_tokens == "required" if http_tokens else None,
+    }
+
+
+def _get_root_ebs_volume_id(instance: Dict[str, Any]) -> Optional[str]:
+    root_device = instance.get("RootDeviceName")
+    return next(
+        (
+            mapping["Ebs"]["VolumeId"]
+            for mapping in instance.get("BlockDeviceMappings", [])
+            if root_device
+            and mapping.get("DeviceName") == root_device
+            and mapping.get("Ebs", {}).get("VolumeId")
+        ),
+        None,
+    )
+
+
+def _get_filesystem_snapshot_skip_reason(
+    instance: Dict[str, Any],
+    eks_cluster_name: Optional[str],
+    root_volume_id: Optional[str],
+) -> Optional[str]:
+    if instance.get("State", {}).get("Name") != "running":
+        return "instance is not running"
+    if instance.get("Platform"):
+        return "non-Linux platform"
+    if instance.get("Architecture") in {"x86_64_mac", "arm64_mac"}:
+        return "macOS is not supported"
+    if eks_cluster_name:
+        return "Kubernetes nodes are excluded"
+    if instance.get("RootDeviceType") != "ebs":
+        return "root device is not EBS"
+    if not root_volume_id:
+        return "root EBS volume is missing"
+    return None
+
+
 @timeit
 @aws_handle_regions
 def get_ec2_instances(boto3_session: boto3.session.Session, region: str) -> List[Dict]:
-    client = boto3_session.client('ec2', region_name=region, config=get_botocore_config())
-    paginator = client.get_paginator('describe_instances')
-    reservations: List[Dict] = []
+    client = create_boto3_client(
+        boto3_session,
+        "ec2",
+        region_name=region,
+        config=get_botocore_config(),
+    )
+    paginator = client.get_paginator("describe_instances")
+    reservations: List[Dict[str, Any]] = []
     for page in paginator.paginate():
-        reservations.extend(page['Reservations'])
+        reservations.extend(page["Reservations"])
     return reservations
 
 
-@timeit
-def load_ec2_instance_network_interfaces(neo4j_session: neo4j.Session, instance_data: Dict, update_tag: int) -> None:
-    ingest_interfaces = """
-    MATCH (instance:EC2Instance{instanceid: {InstanceId}})
-    UNWIND {Interfaces} as interface
-        MERGE (nic:NetworkInterface{id: interface.NetworkInterfaceId})
-        ON CREATE SET nic.firstseen = timestamp()
-        SET nic.status = interface.Status,
-        nic.mac_address = interface.MacAddress,
-        nic.description = interface.Description,
-        nic.private_dns_name = interface.PrivateDnsName,
-        nic.private_ip_address = interface.PrivateIpAddress,
-        nic.lastupdated = {update_tag}
+def transform_ec2_instances(
+    reservations: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+) -> Ec2Data:
+    reservation_list = []
+    instance_list = []
+    subnet_list = []
+    keypair_list = []
+    sg_list = []
+    network_interface_list = []
+    instance_ebs_volumes_list = []
+    ipv6_address_list = []
+    filesystem_snapshot_list = []
+    partition = get_partition(region)
 
-        MERGE (instance)-[r:NETWORK_INTERFACE]->(nic)
-        ON CREATE SET r.firstseen = timestamp()
-        SET r.lastupdated = {update_tag}
-
-        WITH nic, interface
-        WHERE interface.SubnetId IS NOT NULL
-        MERGE (subnet:EC2Subnet{subnetid: interface.SubnetId})
-        ON CREATE SET subnet.firstseen = timestamp()
-        SET subnet.lastupdated = {update_tag}
-
-        MERGE (nic)-[r:PART_OF_SUBNET]->(subnet)
-        ON CREATE SET r.firstseen = timestamp()
-        SET r.lastupdated = {update_tag}
-
-        WITH nic, interface
-        UNWIND interface.Groups as group
-            MATCH (ec2group:EC2SecurityGroup{groupid: group.GroupId})
-            MERGE (nic)-[r:MEMBER_OF_EC2_SECURITY_GROUP]->(ec2group)
-            ON CREATE SET r.firstseen = timestamp()
-            SET r.lastupdated = {update_tag}
-    """
-    instance_id = instance_data["InstanceId"]
-    neo4j_session.run(
-        ingest_interfaces,
-        Interfaces=instance_data['NetworkInterfaces'],
-        InstanceId=instance_id,
-        update_tag=update_tag,
-    ).consume()  # TODO see issue 170
-
-
-@timeit
-def load_ec2_instances(
-        neo4j_session: neo4j.Session, data: List[Dict], region: str, current_aws_account_id: str,
-        update_tag: int,
-) -> None:
-    ingest_reservation = """
-    MERGE (reservation:EC2Reservation{reservationid: {ReservationId}})
-    ON CREATE SET reservation.firstseen = timestamp()
-    SET reservation.ownerid = {OwnerId}, reservation.requesterid = {RequesterId}, reservation.region = {Region},
-    reservation.lastupdated = {update_tag}
-    WITH reservation
-    MATCH (awsAccount:AWSAccount{id: {AWS_ACCOUNT_ID}})
-    MERGE (awsAccount)-[r:RESOURCE]->(reservation)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {update_tag}
-    """
-
-    ingest_instance = """
-    MERGE (instance:Instance:EC2Instance{id: {InstanceId}})
-    ON CREATE SET instance.firstseen = timestamp()
-    SET instance.instanceid = {InstanceId}, instance.publicdnsname = {PublicDnsName},
-    instance.privateipaddress = {PrivateIpAddress}, instance.publicipaddress = {PublicIpAddress},
-    instance.imageid = {ImageId}, instance.instancetype = {InstanceType}, instance.monitoringstate = {MonitoringState},
-    instance.state = {State}, instance.launchtime = {LaunchTime}, instance.launchtimeunix = {LaunchTimeUnix},
-    instance.region = {Region}, instance.lastupdated = {update_tag},
-    instance.iaminstanceprofile = {IamInstanceProfile}, instance.availabilityzone = {AvailabilityZone},
-    instance.tenancy = {Tenancy}, instance.hostresourcegrouparn = {HostResourceGroupArn},
-    instance.platform = {Platform}, instance.architecture = {Architecture}, instance.ebsoptimized = {EbsOptimized},
-    instance.bootmode = {BootMode}, instance.instancelifecycle = {InstanceLifecycle},
-    instance.hibernationoptions = {HibernationOptions}
-    WITH instance
-    MATCH (rez:EC2Reservation{reservationid: {ReservationId}})
-    MERGE (instance)-[r:MEMBER_OF_EC2_RESERVATION]->(rez)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {update_tag}
-    WITH instance
-    MATCH (aa:AWSAccount{id: {AWS_ACCOUNT_ID}})
-    MERGE (aa)-[r:RESOURCE]->(instance)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {update_tag}
-    """
-
-    ingest_subnet = """
-    MATCH (instance:EC2Instance{id: {InstanceId}})
-    MERGE (subnet:EC2Subnet{subnetid: {SubnetId}})
-    ON CREATE SET subnet.firstseen = timestamp()
-    SET subnet.region = {Region},
-    subnet.lastupdated = {update_tag}
-    MERGE (instance)-[r:PART_OF_SUBNET]->(subnet)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {update_tag}
-    """
-
-    ingest_key_pair = """
-    MERGE (keypair:KeyPair:EC2KeyPair{arn: {KeyPairARN}, id: {KeyPairARN}})
-    ON CREATE SET keypair.firstseen = timestamp()
-    SET keypair.keyname = {KeyName}, keypair.region = {Region}, keypair.lastupdated = {update_tag}
-    WITH keypair
-    MATCH (aa:AWSAccount{id: {AWS_ACCOUNT_ID}})
-    MERGE (aa)-[r:RESOURCE]->(keypair)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {update_tag}
-    with keypair
-    MATCH (instance:EC2Instance{instanceid: {InstanceId}})
-    MERGE (instance)<-[r:SSH_LOGIN_TO]-(keypair)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {update_tag}
-    """
-
-    ingest_security_groups = """
-    MERGE (group:EC2SecurityGroup{id: {GroupId}})
-    ON CREATE SET group.firstseen = timestamp(), group.groupid = {GroupId}
-    SET group.name = {GroupName}, group.region = {Region}, group.lastupdated = {update_tag}
-    WITH group
-    MATCH (aa:AWSAccount{id: {AWS_ACCOUNT_ID}})
-    MERGE (aa)-[r:RESOURCE]->(group)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {update_tag}
-    WITH group
-    MATCH (instance:EC2Instance{instanceid: {InstanceId}})
-    MERGE (instance)-[r:MEMBER_OF_EC2_SECURITY_GROUP]->(group)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {update_tag}
-    """
-
-    for reservation in data:
+    for reservation in reservations:
         reservation_id = reservation["ReservationId"]
-
-        neo4j_session.run(
-            ingest_reservation,
-            ReservationId=reservation_id,
-            OwnerId=reservation.get("OwnerId"),
-            RequesterId=reservation.get("RequesterId"),
-            AWS_ACCOUNT_ID=current_aws_account_id,
-            Region=region,
-            update_tag=update_tag,
-        ).consume()  # TODO see issue 170
-
+        reservation_list.append(
+            {
+                "RequesterId": reservation.get("RequesterId"),
+                "ReservationId": reservation["ReservationId"],
+                "OwnerId": reservation["OwnerId"],
+            },
+        )
         for instance in reservation["Instances"]:
-            instanceid = instance["InstanceId"]
-
-            monitoring_state = instance.get("Monitoring", {}).get("State")
-
-            instance_state = instance.get("State", {}).get("Name")
-
-            # NOTE this is a hack because we're using a version of Neo4j that doesn't support temporal data types
+            instance_id = instance["InstanceId"]
             launch_time = instance.get("LaunchTime")
-            if launch_time:
-                launch_time_unix = str(time.mktime(launch_time.timetuple()))
+            launch_time_unix = (
+                str(time.mktime(launch_time.timetuple())) if launch_time else None
+            )
+            eks_cluster_name = _get_eks_cluster_name(instance.get("Tags", []))
+
+            # --- Extract primary IPv6 address for this instance ---
+            # AWS does not surface IPv6 at the top-level instance object; it is
+            # only available under NetworkInterfaces[].Ipv6Addresses[]. We look
+            # at the NI with Attachment.DeviceIndex == 0 (the primary interface),
+            # prefer the entry with IsPrimaryIpv6=True, and fall back to the first
+            # entry in the list. If the primary NI has no IPv6, this is None.
+            primary_ipv6 = None
+            for nic in instance.get("NetworkInterfaces", []):
+                if nic.get("Attachment", {}).get("DeviceIndex") == 0:
+                    ipv6_list = nic.get("Ipv6Addresses", [])
+                    if ipv6_list:
+                        primary_entry = next(
+                            (a for a in ipv6_list if a.get("IsPrimaryIpv6")),
+                            ipv6_list[0],
+                        )
+                        primary_ipv6 = primary_entry.get("Ipv6Address")
+                    break
+
+            metadata_options = _transform_metadata_options(
+                instance.get("MetadataOptions", {}),
+            )
+            instance_list.append(
+                {
+                    "InstanceId": instance_id,
+                    "Arn": f"arn:{partition}:ec2:{region}:{current_aws_account_id}:instance/{instance_id}",
+                    "ReservationId": reservation_id,
+                    "PublicDnsName": instance.get("PublicDnsName"),
+                    "PublicIpAddress": instance.get("PublicIpAddress"),
+                    "PrivateIpAddress": instance.get("PrivateIpAddress"),
+                    "ImageId": instance.get("ImageId"),
+                    "InstanceType": instance.get("InstanceType"),
+                    "IamInstanceProfile": instance.get("IamInstanceProfile", {}).get(
+                        "Arn",
+                    ),
+                    "MonitoringState": instance.get("Monitoring", {}).get("State"),
+                    "LaunchTime": instance.get("LaunchTime"),
+                    "LaunchTimeUnix": launch_time_unix,
+                    "State": instance.get("State", {}).get("Name"),
+                    "AvailabilityZone": instance.get("Placement", {}).get(
+                        "AvailabilityZone",
+                    ),
+                    "Tenancy": instance.get("Placement", {}).get("Tenancy"),
+                    "HostResourceGroupArn": instance.get("Placement", {}).get(
+                        "HostResourceGroupArn",
+                    ),
+                    "Platform": instance.get("Platform"),
+                    "Architecture": instance.get("Architecture"),
+                    "EbsOptimized": instance.get("EbsOptimized"),
+                    "BootMode": instance.get("BootMode"),
+                    "InstanceLifecycle": instance.get("InstanceLifecycle"),
+                    "HibernationOptions": instance.get("HibernationOptions", {}).get(
+                        "Configured",
+                    ),
+                    **metadata_options,
+                    "EksClusterName": eks_cluster_name,
+                    "IPv6Address": primary_ipv6,
+                },
+            )
+
+            root_volume_id = _get_root_ebs_volume_id(instance)
+            skip_reason = _get_filesystem_snapshot_skip_reason(
+                instance, eks_cluster_name, root_volume_id
+            )
+            if skip_reason:
+                logger.debug(
+                    "Skipping EC2 filesystem target for %s: %s",
+                    instance_id,
+                    skip_reason,
+                )
             else:
-                launch_time_unix = ""
+                filesystem_snapshot_list.append(
+                    {
+                        "id": f"aws:ec2:{instance_id}:rootfs",
+                        "instance_id": instance_id,
+                        "volume_id": root_volume_id,
+                        "kind": "rootfs",
+                    },
+                )
 
-            neo4j_session.run(
-                ingest_instance,
-                InstanceId=instanceid,
-                PublicDnsName=instance.get("PublicDnsName"),
-                PublicIpAddress=instance.get("PublicIpAddress"),
-                PrivateIpAddress=instance.get("PrivateIpAddress"),
-                ImageId=instance.get("ImageId"),
-                InstanceType=instance.get("InstanceType"),
-                IamInstanceProfile=instance.get("IamInstanceProfile", {}).get("Arn"),
-                ReservationId=reservation_id,
-                MonitoringState=monitoring_state,
-                LaunchTime=str(launch_time),
-                LaunchTimeUnix=launch_time_unix,
-                State=instance_state,
-                AvailabilityZone=instance.get("Placement", {}).get("AvailabilityZone"),
-                Tenancy=instance.get("Placement", {}).get("Tenancy"),
-                HostResourceGroupArn=instance.get("Placement", {}).get("HostResourceGroupArn"),
-                Platform=instance.get("Platform"),
-                Architecture=instance.get("Architecture"),
-                EbsOptimized=instance.get("EbsOptimized"),
-                BootMode=instance.get("BootMode"),
-                InstanceLifecycle=instance.get("InstanceLifecycle"),
-                HibernationOptions=instance.get("HibernationOptions", {}).get("Configured"),
-                AWS_ACCOUNT_ID=current_aws_account_id,
-                Region=region,
-                update_tag=update_tag,
-            ).consume()  # TODO see issue 170
-
-            # SubnetId can return None intermittently so attach only if non-None.
-            subnet_id = instance.get('SubnetId')
+            subnet_id = instance.get("SubnetId")
             if subnet_id:
-                neo4j_session.run(
-                    ingest_subnet,
-                    InstanceId=instanceid,
-                    SubnetId=subnet_id,
-                    Region=region,
-                    update_tag=update_tag,
+                subnet_list.append(
+                    {
+                        "SubnetId": subnet_id,
+                        "InstanceId": instance_id,
+                    },
                 )
 
             if instance.get("KeyName"):
                 key_name = instance["KeyName"]
-                key_pair_arn = f'arn:aws:ec2:{region}:{current_aws_account_id}:key-pair/{key_name}'
-                neo4j_session.run(
-                    ingest_key_pair,
-                    KeyPairARN=key_pair_arn,
-                    KeyName=key_name,
-                    Region=region,
-                    InstanceId=instanceid,
-                    AWS_ACCOUNT_ID=current_aws_account_id,
-                    update_tag=update_tag,
-                ).consume()  # TODO see issue 170
+                key_pair_arn = f"arn:{partition}:ec2:{region}:{current_aws_account_id}:key-pair/{key_name}"
+                keypair_list.append(
+                    {
+                        "KeyPairArn": key_pair_arn,
+                        "KeyName": key_name,
+                        "InstanceId": instance_id,
+                    },
+                )
 
             if instance.get("SecurityGroups"):
                 for group in instance["SecurityGroups"]:
-                    neo4j_session.run(
-                        ingest_security_groups,
-                        GroupId=group["GroupId"],
-                        GroupName=group.get("GroupName"),
-                        InstanceId=instanceid,
-                        Region=region,
-                        AWS_ACCOUNT_ID=current_aws_account_id,
-                        update_tag=update_tag,
-                    ).consume()  # TODO see issue 170
+                    sg_list.append(
+                        {
+                            "GroupId": group["GroupId"],
+                            "InstanceId": instance_id,
+                        },
+                    )
 
-            load_ec2_instance_network_interfaces(neo4j_session, instance, update_tag)
-            instance_ebs_volumes_list = get_ec2_instance_ebs_volumes(instance)
-            load_ec2_instance_ebs_volumes(neo4j_session, instance_ebs_volumes_list, current_aws_account_id, update_tag)
+            for network_interface in instance["NetworkInterfaces"]:
+                for security_group in network_interface.get("Groups", []):
+                    network_interface_list.append(
+                        {
+                            "NetworkInterfaceId": network_interface[
+                                "NetworkInterfaceId"
+                            ],
+                            "Status": network_interface["Status"],
+                            "MacAddress": network_interface["MacAddress"],
+                            "Description": network_interface["Description"],
+                            "PrivateDnsName": network_interface.get("PrivateDnsName"),
+                            "PrivateIpAddress": network_interface.get(
+                                "PrivateIpAddress"
+                            ),
+                            "InstanceId": instance_id,
+                            "SubnetId": subnet_id,
+                            "GroupId": security_group["GroupId"],
+                        },
+                    )
 
+                # --- Extract IPv6 addresses for this network interface ---
+                # Each NI can have zero or more IPv6 addresses. We create a
+                # separate AWSEC2Ipv6Address node per address so they can be
+                # independently queried and linked to DNS AAAA records via the
+                # Ip label on AWSEC2Ipv6Address and the existing DNS_POINTS_TO rel.
+                nic_id = network_interface["NetworkInterfaceId"]
+                for ipv6_entry in network_interface.get("Ipv6Addresses", []):
+                    ipv6_addr = ipv6_entry.get("Ipv6Address")
+                    if ipv6_addr:
+                        ipv6_address_list.append(
+                            {
+                                "Ipv6Address": ipv6_addr,
+                                "NetworkInterfaceId": nic_id,
+                                # IsPrimaryIpv6 may be absent on older API versions;
+                                # default to False rather than None for clean bool storage.
+                                "IsPrimaryIpv6": ipv6_entry.get("IsPrimaryIpv6", False),
+                            },
+                        )
 
-@timeit
-def get_ec2_instance_ebs_volumes(instance: Dict) -> List[Dict]:
-    instance_ebs_volumes_list: List[Dict] = []
-    if 'BlockDeviceMappings' in instance and len(instance['BlockDeviceMappings']) > 0:
-        for mapping in instance['BlockDeviceMappings']:
-            if 'VolumeId' in mapping['Ebs']:
-                mapping['InstanceId'] = instance["InstanceId"]
-                instance_ebs_volumes_list.append(mapping)
-    return instance_ebs_volumes_list
+            if (
+                "BlockDeviceMappings" in instance
+                and len(instance["BlockDeviceMappings"]) > 0
+            ):
+                for mapping in instance["BlockDeviceMappings"]:
+                    if "VolumeId" in mapping["Ebs"]:
+                        instance_ebs_volumes_list.append(
+                            {
+                                "InstanceId": instance_id,
+                                "VolumeId": mapping["Ebs"]["VolumeId"],
+                                "DeleteOnTermination": mapping["Ebs"][
+                                    "DeleteOnTermination"
+                                ],
+                                # 'SnapshotId': mapping['Ebs']['SnapshotId'],  # TODO check on this
+                            },
+                        )
 
-
-@timeit
-def load_ec2_instance_ebs_volumes(
-        neo4j_session: neo4j.Session, data: List[Dict], current_aws_account_id: str, update_tag: int,
-) -> None:
-    ingest_volume = """
-    UNWIND {ebs_mappings_list} as em
-        MERGE (vol:EBSVolume{id: em.Ebs.VolumeId})
-        ON CREATE SET vol.firstseen = timestamp()
-        SET vol.lastupdated = {update_tag}, vol.deleteontermination = em.Ebs.DeleteOnTermination
-        WITH vol, em
-        MATCH (aa:AWSAccount{id: {AWS_ACCOUNT_ID}})
-        MERGE (aa)-[r:RESOURCE]->(vol)
-        ON CREATE SET r.firstseen = timestamp()
-        SET r.lastupdated = {update_tag}
-        WITH vol, em
-        MATCH (instance:EC2Instance{instanceid: em.InstanceId})
-        MERGE (vol)-[r:ATTACHED_TO]->(instance)
-        ON CREATE SET r.firstseen = timestamp()
-        SET r.lastupdated = {update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_volume,
-        ebs_mappings_list=data,
-        update_tag=update_tag,
-        AWS_ACCOUNT_ID=current_aws_account_id,
+    return Ec2Data(
+        reservation_list=reservation_list,
+        instance_list=instance_list,
+        subnet_list=subnet_list,
+        sg_list=sg_list,
+        keypair_list=keypair_list,
+        network_interface_list=network_interface_list,
+        instance_ebs_volumes_list=instance_ebs_volumes_list,
+        ipv6_address_list=ipv6_address_list,
+        filesystem_snapshot_list=filesystem_snapshot_list,
     )
 
 
 @timeit
-def cleanup_ec2_instances(neo4j_session: neo4j.Session, common_job_parameters: Dict) -> None:
-    run_cleanup_job('aws_import_ec2_instances_cleanup.json', neo4j_session, common_job_parameters)
+def load_ec2_reservations(
+    neo4j_session: neo4j.Session,
+    reservation_list: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        EC2ReservationSchema(),
+        reservation_list,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_ec2_subnets(
+    neo4j_session: neo4j.Session,
+    subnet_list: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        EC2SubnetInstanceSchema(),
+        subnet_list,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_ec2_keypair_instances(
+    neo4j_session: neo4j.Session,
+    key_pair_list: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    # Load EC2 keypairs as known by describe-instances.
+    load(
+        neo4j_session,
+        EC2KeyPairInstanceSchema(),
+        key_pair_list,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_ec2_security_groups(
+    neo4j_session: neo4j.Session,
+    sg_list: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        EC2SecurityGroupInstanceSchema(),
+        sg_list,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_ec2_network_interfaces(
+    neo4j_session: neo4j.Session,
+    network_interface_list: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        EC2NetworkInterfaceInstanceSchema(),
+        network_interface_list,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_ec2_instance_nodes(
+    neo4j_session: neo4j.Session,
+    data: List[Dict],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        EC2InstanceSchema(),
+        data,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_ec2_filesystem_snapshots(
+    neo4j_session: neo4j.Session,
+    filesystem_snapshot_list: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        EC2FilesystemSnapshotSchema(),
+        filesystem_snapshot_list,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_ec2_instance_ebs_volumes(
+    neo4j_session: neo4j.Session,
+    ebs_data: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        EBSVolumeInstanceSchema(),
+        ebs_data,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_ec2_ipv6_addresses(
+    neo4j_session: neo4j.Session,
+    ipv6_address_list: List[Dict[str, Any]],
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    load(
+        neo4j_session,
+        EC2Ipv6AddressSchema(),
+        ipv6_address_list,
+        Region=region,
+        AWS_ID=current_aws_account_id,
+        lastupdated=update_tag,
+    )
+
+
+def load_ec2_instance_data(
+    neo4j_session: neo4j.Session,
+    region: str,
+    current_aws_account_id: str,
+    update_tag: int,
+    reservation_list: List[Dict[str, Any]],
+    instance_list: List[Dict[str, Any]],
+    subnet_list: List[Dict[str, Any]],
+    sg_list: List[Dict[str, Any]],
+    key_pair_list: List[Dict[str, Any]],
+    nic_list: List[Dict[str, Any]],
+    ebs_volumes_list: List[Dict[str, Any]],
+    ipv6_address_list: List[Dict[str, Any]],
+    filesystem_snapshot_list: List[Dict[str, Any]],
+) -> None:
+    load_ec2_reservations(
+        neo4j_session,
+        reservation_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+    load_ec2_instance_nodes(
+        neo4j_session,
+        instance_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+    load_ec2_subnets(
+        neo4j_session,
+        subnet_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+    load_ec2_security_groups(
+        neo4j_session,
+        sg_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+    load_ec2_keypair_instances(
+        neo4j_session,
+        key_pair_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+    load_ec2_network_interfaces(
+        neo4j_session,
+        nic_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+    load_ec2_instance_ebs_volumes(
+        neo4j_session,
+        ebs_volumes_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+    # SNAPSHOT_OF requires the root EBS volume nodes to be loaded first.
+    load_ec2_filesystem_snapshots(
+        neo4j_session,
+        filesystem_snapshot_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+    load_ec2_ipv6_addresses(
+        neo4j_session,
+        ipv6_address_list,
+        region,
+        current_aws_account_id,
+        update_tag,
+    )
+
+
+@timeit
+def sync_ec2_instance_assumes_role(
+    neo4j_session: neo4j.Session,
+    current_aws_account_id: str,
+    update_tag: int,
+) -> None:
+    # Assemble (instance, role) pairs from the instance-profile binding chain,
+    # since the AWS API exposes no direct instance->role edge, and load them as
+    # the canonical ASSUMES ontology edge. Scoped to the current account so the
+    # MatchLink cleanup only touches this account's edges.
+    query = """
+    MATCH (:AWSAccount{id: $AccountId})-[:RESOURCE]->(i:AWSEC2Instance)
+        -[:INSTANCE_PROFILE]->(:AWSInstanceProfile)-[:ASSOCIATED_WITH]->(r:AWSRole)
+    WHERE i.id IS NOT NULL AND r.arn IS NOT NULL
+    RETURN i.id AS instance_id, r.arn AS role_arn
+    """
+    pairs = [
+        {"instance_id": record["instance_id"], "role_arn": record["role_arn"]}
+        for record in neo4j_session.run(query, AccountId=current_aws_account_id)
+    ]
+
+    load_matchlinks(
+        neo4j_session,
+        EC2InstanceToRoleAssumesMatchLink(),
+        pairs,
+        lastupdated=update_tag,
+        _sub_resource_label="AWSAccount",
+        _sub_resource_id=current_aws_account_id,
+    )
+
+    GraphJob.from_matchlink(
+        EC2InstanceToRoleAssumesMatchLink(),
+        sub_resource_label="AWSAccount",
+        sub_resource_id=current_aws_account_id,
+        update_tag=update_tag,
+    ).run(neo4j_session)
+
+
+@timeit
+def cleanup(
+    neo4j_session: neo4j.Session,
+    common_job_parameters: Dict[str, Any],
+) -> None:
+    logger.debug("Running EC2 instance cleanup")
+    GraphJob.from_node_schema(EC2ReservationSchema(), common_job_parameters).run(
+        neo4j_session,
+    )
+    GraphJob.from_node_schema(EC2InstanceSchema(), common_job_parameters).run(
+        neo4j_session,
+    )
+    GraphJob.from_node_schema(EC2FilesystemSnapshotSchema(), common_job_parameters).run(
+        neo4j_session,
+    )
+    GraphJob.from_node_schema(
+        EC2InstanceAutoScalingGroupSchema(),
+        common_job_parameters,
+    ).run(neo4j_session)
+    GraphJob.from_node_schema(EC2Ipv6AddressSchema(), common_job_parameters).run(
+        neo4j_session,
+    )
 
 
 @timeit
 def sync_ec2_instances(
-        neo4j_session: neo4j.Session, boto3_session: boto3.session.Session, regions: List[str],
-        current_aws_account_id: str, update_tag: int, common_job_parameters: Dict,
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.session.Session,
+    regions: List[str],
+    current_aws_account_id: str,
+    update_tag: int,
+    common_job_parameters: Dict[str, Any],
 ) -> None:
     for region in regions:
-        logger.info("Syncing EC2 instances for region '%s' in account '%s'.", region, current_aws_account_id)
-        data = get_ec2_instances(boto3_session, region)
-        load_ec2_instances(neo4j_session, data, region, current_aws_account_id, update_tag)
-    cleanup_ec2_instances(neo4j_session, common_job_parameters)
+        logger.info(
+            "Syncing EC2 instances for region '%s' in account '%s'.",
+            region,
+            current_aws_account_id,
+        )
+        reservations = get_ec2_instances(boto3_session, region)
+        ec2_data = transform_ec2_instances(reservations, region, current_aws_account_id)
+        load_ec2_instance_data(
+            neo4j_session,
+            region,
+            current_aws_account_id,
+            update_tag,
+            ec2_data.reservation_list,
+            ec2_data.instance_list,
+            ec2_data.subnet_list,
+            ec2_data.sg_list,
+            ec2_data.keypair_list,
+            ec2_data.network_interface_list,
+            ec2_data.instance_ebs_volumes_list,
+            ec2_data.ipv6_address_list,
+            ec2_data.filesystem_snapshot_list,
+        )
+    # Clean up stale instances / INSTANCE_PROFILE edges first so the ASSUMES
+    # edges are derived from the current profile chain only (a re-profiled
+    # instance would otherwise keep an obsolete role binding for one cycle).
+    cleanup(neo4j_session, common_job_parameters)
+    sync_ec2_instance_assumes_role(
+        neo4j_session,
+        current_aws_account_id,
+        update_tag,
+    )

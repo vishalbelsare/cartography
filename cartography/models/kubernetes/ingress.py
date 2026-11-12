@@ -1,0 +1,230 @@
+from dataclasses import dataclass
+
+from cartography.models.core.common import PropertyRef
+from cartography.models.core.nodes import CartographyNodeProperties
+from cartography.models.core.nodes import CartographyNodeSchema
+from cartography.models.core.relationships import CartographyRelProperties
+from cartography.models.core.relationships import CartographyRelSchema
+from cartography.models.core.relationships import LinkDirection
+from cartography.models.core.relationships import make_target_node_matcher
+from cartography.models.core.relationships import OtherRelationships
+from cartography.models.core.relationships import TargetNodeMatcher
+
+
+@dataclass(frozen=True)
+class KubernetesIngressNodeProperties(CartographyNodeProperties):
+    id: PropertyRef = PropertyRef("uid", description="UID of the Kubernetes Ingress.")
+    load_balancer_ips: PropertyRef = PropertyRef(
+        "load_balancer_ips",
+        description="Assigned IP addresses from the Kubernetes `Ingress.status.loadBalancer.ingress[].ip` field, not requested spec addresses. Used to match GCP forwarding rules for GKE clusters.",
+    )
+    name: PropertyRef = PropertyRef(
+        "name", description="Name of the Kubernetes Ingress."
+    )
+    namespace: PropertyRef = PropertyRef(
+        "namespace",
+        extra_index=True,
+        description="The Kubernetes namespace where this Ingress is deployed.",
+    )
+    creation_timestamp: PropertyRef = PropertyRef(
+        "creation_timestamp",
+        description="Timestamp of the creation time of the Kubernetes Ingress.",
+    )
+    deletion_timestamp: PropertyRef = PropertyRef(
+        "deletion_timestamp",
+        description="Timestamp of the deletion time of the Kubernetes Ingress.",
+    )
+    ingress_class_name: PropertyRef = PropertyRef(
+        "ingress_class_name",
+        description="The name of the IngressClass cluster resource. Specifies which controller will implement the ingress (e.g. `nginx`, `alb`).",
+    )
+    rules: PropertyRef = PropertyRef(
+        "rules",
+        description="The list of host rules used to configure the Ingress. Stored as a JSON-encoded string containing host/path routing rules.",
+    )
+    annotations: PropertyRef = PropertyRef(
+        "annotations",
+        description="Annotations on the Ingress resource. Stored as a JSON-encoded string. Contains controller-specific configuration.",
+    )
+    default_backend: PropertyRef = PropertyRef(
+        "default_backend",
+        description="A default backend capable of servicing requests that don't match any rule. Stored as a JSON-encoded string.",
+    )
+    host_names: PropertyRef = PropertyRef(
+        "host_names", description="Hostnames configured by the ingress rules."
+    )
+    host_names_normalized: PropertyRef = PropertyRef(
+        "host_names_normalized",
+        description="Normalized hostnames from ingress rules.",
+    )
+    cluster_name: PropertyRef = PropertyRef(
+        "CLUSTER_NAME",
+        set_in_kwargs=True,
+        description="Name of the Kubernetes cluster where this Ingress is deployed.",
+    )
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+    load_balancer_dns_names: PropertyRef = PropertyRef(
+        "load_balancer_dns_names",
+        description="List of DNS hostnames from the Ingress status. Used to match to cloud load balancers (e.g., AWS ALB).",
+    )
+    # AWS Load Balancer Controller group name
+    ingress_group_name: PropertyRef = PropertyRef(
+        "ingress_group_name",
+        extra_index=True,
+        description="The ingress group name from the `alb.ingress.kubernetes.io/group.name` annotation (AWS Load Balancer Controller). Allows multiple Ingresses to share a single ALB.",
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesIngressToKubernetesClusterRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+# (:KubernetesIngress)<-[:RESOURCE]-(:KubernetesCluster)
+class KubernetesIngressToKubernetesClusterRel(CartographyRelSchema):
+    """Links a cluster to one of its ingresses."""
+
+    target_node_label: str = "KubernetesCluster"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {"id": PropertyRef("CLUSTER_ID", set_in_kwargs=True)}
+    )
+    direction: LinkDirection = LinkDirection.INWARD
+    rel_label: str = "RESOURCE"
+    properties: KubernetesIngressToKubernetesClusterRelProperties = (
+        KubernetesIngressToKubernetesClusterRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesIngressToKubernetesNamespaceRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+# (:KubernetesIngress)<-[:CONTAINS]-(:KubernetesNamespace)
+class KubernetesIngressToKubernetesNamespaceRel(CartographyRelSchema):
+    """Links a namespace to an ingress it contains."""
+
+    target_node_label: str = "KubernetesNamespace"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "cluster_name": PropertyRef("CLUSTER_NAME", set_in_kwargs=True),
+            "name": PropertyRef("namespace"),
+        }
+    )
+    direction: LinkDirection = LinkDirection.INWARD
+    rel_label: str = "CONTAINS"
+    properties: KubernetesIngressToKubernetesNamespaceRelProperties = (
+        KubernetesIngressToKubernetesNamespaceRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesIngressToKubernetesServiceRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+# (:KubernetesIngress)-[:TARGETS]->(:KubernetesService)
+class KubernetesIngressToKubernetesServiceRel(CartographyRelSchema):
+    """Links an ingress to a service named as a backend in its routing rules or default backend. This is declared configuration, not a network hop: traffic reaches the service through the ingress controller's data path, such as a cloud load balancer or controller pods."""
+
+    target_node_label: str = "KubernetesService"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "cluster_name": PropertyRef("CLUSTER_NAME", set_in_kwargs=True),
+            "namespace": PropertyRef("namespace"),
+            "name": PropertyRef("target_services", one_to_many=True),
+        }
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "TARGETS"
+    properties: KubernetesIngressToKubernetesServiceRelProperties = (
+        KubernetesIngressToKubernetesServiceRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesIngressToLoadBalancerV2RelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+# (:KubernetesIngress)-[:USES_LOAD_BALANCER]->(:AWSLoadBalancerV2)
+class KubernetesIngressToLoadBalancerV2Rel(CartographyRelSchema):
+    """Links an ingress to the AWS load balancer that implements it, matched by the DNS hostname from the ingress status to the load balancer's DNS name; both are lowercased at ingestion. This is controller configuration: a DNS record for an ingress host can resolve to a different load balancer, such as one bound to services through a TargetGroupBinding."""
+
+    target_node_label: str = "AWSLoadBalancerV2"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {"dnsname": PropertyRef("load_balancer_dns_names", one_to_many=True)}
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "USES_LOAD_BALANCER"
+    properties: KubernetesIngressToLoadBalancerV2RelProperties = (
+        KubernetesIngressToLoadBalancerV2RelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesIngressToGCPForwardingRuleRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+# (:KubernetesIngress)-[:USES_LOAD_BALANCER]->(:GCPForwardingRule)
+class KubernetesIngressToGCPForwardingRuleRel(CartographyRelSchema):
+    """Links an ingress to the external GCP forwarding rule that exposes it, matching public `status.loadBalancer.ingress[].ip` addresses against `GCPForwardingRule.ip_address` within the GKE cluster's project. Only created for clusters ingested with GKE metadata. Backend health and firewall reachability are not evaluated."""
+
+    target_node_label: str = "GCPForwardingRule"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "ip_address": PropertyRef("gcp_public_lb_ips", one_to_many=True),
+            "project_id": PropertyRef("gcp_project_id"),
+        }
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "USES_LOAD_BALANCER"
+    properties: KubernetesIngressToGCPForwardingRuleRelProperties = (
+        KubernetesIngressToGCPForwardingRuleRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+# (:KubernetesIngress)-[:USES_LOAD_BALANCER]->(:GCPForwardingRule)
+class KubernetesIngressToGCPInternalForwardingRuleRel(CartographyRelSchema):
+    """Links an ingress to the internal GCP forwarding rule that exposes it, matching private `status.loadBalancer.ingress[].ip` addresses against `GCPForwardingRule.ip_address` within the GKE cluster's project and VPC network, so private addresses reused in other networks do not collide."""
+
+    target_node_label: str = "GCPForwardingRule"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "ip_address": PropertyRef("gcp_private_lb_ips", one_to_many=True),
+            "project_id": PropertyRef("gcp_project_id"),
+            "network": PropertyRef("gcp_network"),
+        }
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "USES_LOAD_BALANCER"
+    properties: KubernetesIngressToGCPForwardingRuleRelProperties = (
+        KubernetesIngressToGCPForwardingRuleRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class KubernetesIngressSchema(CartographyNodeSchema):
+    "A Kubernetes ingress that routes external traffic to services."
+
+    label: str = "KubernetesIngress"
+    properties: KubernetesIngressNodeProperties = KubernetesIngressNodeProperties()
+    sub_resource_relationship: KubernetesIngressToKubernetesClusterRel = (
+        KubernetesIngressToKubernetesClusterRel()
+    )
+    other_relationships: OtherRelationships = OtherRelationships(
+        [
+            KubernetesIngressToKubernetesNamespaceRel(),
+            KubernetesIngressToKubernetesServiceRel(),
+            KubernetesIngressToLoadBalancerV2Rel(),
+            KubernetesIngressToGCPForwardingRuleRel(),
+            KubernetesIngressToGCPInternalForwardingRuleRel(),
+        ]
+    )

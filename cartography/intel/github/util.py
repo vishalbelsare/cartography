@@ -1,19 +1,169 @@
+import base64
 import json
 import logging
+import random
 import time
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Tuple
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone as tz
+from typing import Any
+from typing import NamedTuple
+from urllib.parse import quote
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
 import requests
+from dateutil.parser import isoparse
 
 logger = logging.getLogger(__name__)
 # Connect and read timeouts of 60 seconds each; see https://requests.readthedocs.io/en/master/user/advanced/#timeouts
 _TIMEOUT = (60, 60)
 
 
-def call_github_api(query: str, variables: str, token: str, api_url: str) -> Dict:
+def _resolve_token(token: Any) -> str:
+    """Resolve a token string or GitHubCredential to a plain token string."""
+    if isinstance(token, str):
+        return token
+    result: str = token.get_token()
+    return result
+
+
+_GRAPHQL_RATE_LIMIT_REMAINING_THRESHOLD = 500
+_REST_RATE_LIMIT_REMAINING_THRESHOLD = 100
+# Search API has a stricter rate limit (30 requests/minute for authenticated users)
+_SEARCH_RATE_LIMIT_REMAINING_THRESHOLD = 5
+# HTTP status codes that are safe to retry with exponential backoff
+_TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+# Add up to +25% so concurrent retries do not hit GitHub in lockstep.
+_RETRY_JITTER_RATIO = 0.25
+
+
+def sleep_with_jitter(delay: float) -> None:
+    """
+    Sleep for `delay` seconds plus jitter. A delay of 0 skips the sleep entirely.
+    """
+    if delay <= 0:
+        return
+    time.sleep(delay * (1 + random.random() * _RETRY_JITTER_RATIO))
+
+
+class PaginatedGraphqlData(NamedTuple):
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+
+
+def _extract_error_message(response: requests.Response) -> str:
+    """Extract a readable error message from a GitHub API response."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text
+
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str):
+            return message
+        errors = payload.get("errors")
+        if isinstance(errors, list):
+            parts = []
+            for error in errors:
+                if isinstance(error, dict):
+                    error_message = error.get("message")
+                    if isinstance(error_message, str):
+                        parts.append(error_message)
+            if parts:
+                return "; ".join(parts)
+    return response.text
+
+
+def _get_rate_limit_reset_sleep_seconds(response: requests.Response) -> int | None:
+    """Return seconds to sleep until the primary rate limit resets, if available."""
+    remaining = response.headers.get("x-ratelimit-remaining")
+    reset = response.headers.get("x-ratelimit-reset")
+    if remaining != "0" or not reset:
+        return None
+
+    try:
+        reset_at = datetime.fromtimestamp(int(reset), tz=tz.utc)
+    except ValueError:
+        return None
+
+    now = datetime.now(tz.utc)
+    sleep_duration = reset_at - now + timedelta(minutes=1)
+    return max(0, int(sleep_duration.total_seconds()))
+
+
+def get_retry_sleep_seconds_for_http_error(
+    err: requests.exceptions.HTTPError,
+    retry: int,
+) -> int | None:
+    """Return a retry delay, or None for a non-retryable HTTP error."""
+    response = err.response
+    default_sleep_seconds: int = int(2**retry)
+    if response is None:
+        return None
+
+    if response.status_code not in (403, 429):
+        return (
+            default_sleep_seconds
+            if response.status_code in _TRANSIENT_STATUS_CODES
+            else None
+        )
+
+    retry_after = response.headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(0, int(retry_after))
+        except ValueError:
+            pass
+
+    reset_sleep_seconds = _get_rate_limit_reset_sleep_seconds(response)
+    if reset_sleep_seconds is not None:
+        return reset_sleep_seconds
+
+    message = _extract_error_message(response).lower()
+    if (
+        response.status_code == 429
+        or response.headers.get("x-ratelimit-remaining") == "0"
+        or retry_after is not None
+        or "secondary rate limit" in message
+        or "abuse detection" in message
+    ):
+        # Without a reset or Retry-After, GitHub requires at least a minute,
+        # increasing exponentially if the secondary limit persists.
+        return int(60 * 2 ** (retry - 1))
+
+    return None
+
+
+def handle_rate_limit_sleep(token: Any, api_url: str) -> None:
+    """Wait for the configured instance's GraphQL budget to reset when low."""
+    response = requests.get(
+        f"{rest_api_base_url(api_url)}/rate_limit",
+        headers={"Authorization": f"Bearer {_resolve_token(token)}"},
+        timeout=_TIMEOUT,
+    )
+    response.raise_for_status()
+    response_json = response.json()
+    rate_limit_obj = response_json["resources"]["graphql"]
+    remaining = rate_limit_obj["remaining"]
+    threshold = _GRAPHQL_RATE_LIMIT_REMAINING_THRESHOLD
+    if remaining > threshold:
+        return
+    reset_at = datetime.fromtimestamp(rate_limit_obj["reset"], tz=tz.utc)
+    now = datetime.now(tz.utc)
+    # add an extra minute for safety
+    sleep_duration = reset_at - now + timedelta(minutes=1)
+    logger.warning(
+        f"Github graphql ratelimit has {remaining} remaining and is under threshold {threshold},"
+        f" sleeping until reset at {reset_at} for {sleep_duration}",
+    )
+    time.sleep(max(0, sleep_duration.total_seconds()))
+
+
+def call_github_api(query: str, variables: str, token: str, api_url: str) -> dict:
     """
     Calls the GitHub v4 API and executes a query
     :param query: the GraphQL query to run
@@ -22,11 +172,11 @@ def call_github_api(query: str, variables: str, token: str, api_url: str) -> Dic
     :param api_url: the URL to call for the API
     :return: query results json
     """
-    headers = {'Authorization': f"token {token}"}
+    headers = {"Authorization": f"Bearer {_resolve_token(token)}"}
     try:
         response = requests.post(
             api_url,
-            json={'query': query, 'variables': variables},
+            json={"query": query, "variables": variables},
             headers=headers,
             timeout=_TIMEOUT,
         )
@@ -35,10 +185,28 @@ def call_github_api(query: str, variables: str, token: str, api_url: str) -> Dic
         logger.warning("GitHub: requests.get('%s') timed out.", api_url)
         raise
     response.raise_for_status()
-    return response.json()
+    response_json = response.json()
+    if "errors" in response_json:
+        # Severity belongs to the caller: a caller with a retry path (see
+        # `fetch_all()` and `_fetch_manifest_page()`) recovers from most of these,
+        # and warning here would bury the one line that does warrant investigation
+        # under hundreds of recovered ones. Callers with no retry path warn
+        # themselves.
+        logger.debug(
+            "call_github_api() response has errors: %s",
+            response_json["errors"],
+        )
+    return response_json  # type: ignore
 
 
-def fetch_page(token: str, api_url: str, organization: str, query: str, cursor: Optional[str] = None) -> Dict:
+def fetch_page(
+    token: str,
+    api_url: str,
+    organization: str,
+    query: str,
+    cursor: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
     """
     Return a single page of max size 100 elements from the Github api_url using the given `query` and `cursor` params.
     :param token: The API token as string. Must have permission for the object being paginated.
@@ -47,11 +215,13 @@ def fetch_page(token: str, api_url: str, organization: str, query: str, cursor: 
     :param query: The GraphQL query, e.g. `GITHUB_ORG_USERS_PAGINATED_GRAPHQL`
     :param cursor: The GraphQL cursor string (behaves like a page number) for Github objects in the given
     organization. If None, the Github API will return the first page of repos.
+    :param kwargs: Other keyword args to add as key-value pairs to the GraphQL query.
     :return: The raw response object from the requests.get().json() call.
     """
     gql_vars = {
-        'login': organization,
-        'cursor': cursor,
+        **kwargs,
+        "login": organization,
+        "cursor": cursor,
     }
     gql_vars_json = json.dumps(gql_vars)
     response = call_github_api(query, gql_vars_json, token, api_url)
@@ -59,8 +229,15 @@ def fetch_page(token: str, api_url: str, organization: str, query: str, cursor: 
 
 
 def fetch_all(
-    token: str, api_url: str, organization: str, query: str, resource_type: str, field_name: str, retries: int = 5,
-) -> Tuple[List[Dict], Dict]:
+    token: str,
+    api_url: str,
+    organization: str,
+    query: str,
+    resource_type: str,
+    retries: int = 5,
+    resource_inner_type: str | None = None,
+    **kwargs: Any,
+) -> tuple[PaginatedGraphqlData, dict[str, Any]]:
     """
     Fetch and return all data items of the given `resource_type` and `field_name` from Github's paginated GraphQL API as
     a list, along with information on the organization that they belong to.
@@ -71,40 +248,747 @@ def fetch_all(
     :param resource_type: The name of the paginated resource under the organization e.g. `membersWithRole` or
     `repositories`. See the fields under https://docs.github.com/en/graphql/reference/objects#organization for a full
     list.
-    :param field_name: The field name of the resource_type to append items from - this is usually "nodes" or "edges".
-    See the field list in https://docs.github.com/en/graphql/reference/objects#repositoryconnection for other examples.
     :param retries: Number of retries to perform.  Github APIs are often flakey and retrying the request helps.
+    :param resource_inner_type: Optional str. Default = None. Sometimes we need to paginate a field that is inside
+    `resource_type` - for example: organization['team']['repositories']. In this case, we specify 'repositories' as the
+    `resource_inner_type`.
+    :param kwargs: Additional key-value args (other than `login` and `cursor`) to pass to the GraphQL query variables.
     :return: A 2-tuple containing 1. A list of data items of the given `resource_type` and `field_name`,  and 2. a dict
     containing the `url` and the `login` fields of the organization that the items belong to.
     """
     cursor = None
     has_next_page = True
-    data: List[Dict] = []
+    org_data: dict[str, Any] = {}
+    data: PaginatedGraphqlData = PaginatedGraphqlData(nodes=[], edges=[])
     retry = 0
+    null_resource_retry = 0
+
     while has_next_page:
+        exc: Any = None
         try:
-            resp = fetch_page(token, api_url, organization, query, cursor)
+            # In the future, we may use also use the rateLimit object from the graphql response.
+            # But we still need at least one call to the REST endpoint in case the graphql remaining is already 0
+            handle_rate_limit_sleep(token, api_url)
+            resp = fetch_page(token, api_url, organization, query, cursor, **kwargs)
             retry = 0
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as err:
             retry += 1
-        except requests.exceptions.HTTPError:
+            exc = err
+        except requests.exceptions.HTTPError as err:
+            if (
+                err.response is not None
+                and err.response.status_code == 502
+                and kwargs.get("count")
+                and kwargs["count"] > 1
+            ):
+                kwargs["count"] = max(1, kwargs["count"] // 2)
+                logger.warning(
+                    "GitHub: Received 502 response. Reducing page size to %s and retrying.",
+                    kwargs["count"],
+                )
+                continue
             retry += 1
-        except requests.exceptions.ChunkedEncodingError:
+            exc = err
+        except requests.exceptions.ChunkedEncodingError as err:
             retry += 1
+            exc = err
+        except requests.exceptions.ConnectionError as err:
+            retry += 1
+            exc = err
 
         if retry >= retries:
             logger.error(
-                f"GitHub: Could not retrieve page of resource `{resource_type}` due to HTTP error.",
+                f"GitHub: Could not retrieve page of resource `{resource_type}` due to HTTP error "
+                f"after {retry} retries. Raising exception.",
                 exc_info=True,
             )
-            raise
+            raise exc
         elif retry > 0:
-            time.sleep(1 * retry)
+            sleep_seconds = 2**retry
+            if isinstance(exc, requests.exceptions.HTTPError):
+                retry_delay = get_retry_sleep_seconds_for_http_error(exc, retry)
+                if retry_delay is None:
+                    raise exc
+                sleep_seconds = retry_delay
+                response = exc.response
+                status_code = (
+                    response.status_code if response is not None else "unknown"
+                )
+                message = (
+                    _extract_error_message(response)
+                    if response is not None
+                    else str(exc)
+                )
+                logger.warning(
+                    "GitHub: HTTP %s while retrieving resource `%s` for org `%s`; retry %d/%d in %s seconds. Message: %s",
+                    status_code,
+                    resource_type,
+                    organization,
+                    retry,
+                    retries,
+                    sleep_seconds,
+                    message,
+                )
+            sleep_with_jitter(sleep_seconds)
             continue
 
-        resource = resp['data']['organization'][resource_type]
-        data.extend(resource[field_name])
-        cursor = resource['pageInfo']['endCursor']
-        has_next_page = resource['pageInfo']['hasNextPage']
-    org_data = {'url': resp['data']['organization']['url'], 'login': resp['data']['organization']['login']}
+        if "data" not in resp:
+            logger.warning(
+                f'Got no "data" attribute in response: {resp}. '
+                f"Stopping requests for organization: {organization} and "
+                f"resource_type: {resource_type}",
+            )
+            has_next_page = False
+            continue
+
+        if resp["data"].get("organization") is None:
+            errors = resp.get("errors", [])
+            error_messages = "; ".join(e.get("message", "") for e in errors)
+            raise ValueError(
+                f"Didn't get any organization data for '{organization}': {error_messages}",
+            )
+
+        resource = resp["data"]["organization"][resource_type]
+        if resource_inner_type:
+            resource = resp["data"]["organization"][resource_type][resource_inner_type]
+
+        if resource is None:
+            null_resource_retry += 1
+            if null_resource_retry >= retries:
+                raise ValueError(
+                    f"Got null resource for organization: {organization}, resource_type: {resource_type}, "
+                    f"resource_inner_type: {resource_inner_type} after {null_resource_retry} retries. "
+                    f"This may indicate a GitHub API timeout on a nested field.",
+                )
+            logger.warning(
+                "Got null resource for organization: %s, resource_type: %s, resource_inner_type: %s. "
+                "Retrying (%d/%d).",
+                organization,
+                resource_type,
+                resource_inner_type,
+                null_resource_retry,
+                retries,
+            )
+            sleep_with_jitter(2**null_resource_retry)
+            continue
+
+        # Successful non-null resource; reset null-resource retry counter.
+        null_resource_retry = 0
+
+        # The page is usable, so nothing above retries it. Any errors GitHub still
+        # reported are therefore terminal for this page and may mean it is
+        # incomplete, so surface them here rather than in call_github_api().
+        if resp.get("errors"):
+            logger.warning(
+                "GitHub returned errors alongside a usable page of resource `%s` for org `%s`; "
+                "the page may be incomplete. Errors: %s",
+                resource_type,
+                organization,
+                resp["errors"],
+            )
+
+        # Allow for paginating both nodes and edges fields of the GitHub GQL structure.
+        data.nodes.extend(resource.get("nodes", []))
+        data.edges.extend(resource.get("edges", []))
+
+        cursor = resource["pageInfo"]["endCursor"]
+        has_next_page = resource["pageInfo"]["hasNextPage"]
+        if not org_data:
+            org_data = {
+                "url": resp["data"]["organization"]["url"],
+                "login": resp["data"]["organization"]["login"],
+            }
+
+    if not org_data:
+        raise ValueError(
+            f"Didn't get any organization data for organization: {organization} and resource_type: {resource_type}",
+        )
     return data, org_data
+
+
+def _get_rest_api_base_url(graphql_url: str) -> str:
+    """
+    Convert a GitHub GraphQL API URL to a REST API base URL.
+
+    For github.com: https://api.github.com/graphql -> https://api.github.com
+    For GitHub Enterprise: https://github.example.com/api/graphql -> https://github.example.com/api/v3
+
+    :param graphql_url: The GitHub GraphQL API URL
+    :return: The REST API base URL
+    """
+    if "api.github.com" in graphql_url:
+        return "https://api.github.com"
+    # GitHub Enterprise URL format
+    # e.g., https://github.example.com/api/graphql -> https://github.example.com/api/v3
+    base = graphql_url.replace("/graphql", "").rstrip("/")
+    if not base.endswith("/v3"):
+        base = f"{base}/v3"
+    return base
+
+
+def rest_api_base_url(api_url: str) -> str:
+    """Public wrapper that accepts a REST or GraphQL URL and returns the REST base URL."""
+    normalized_url = api_url.rstrip("/")
+    if normalized_url.endswith("/graphql"):
+        return _get_rest_api_base_url(normalized_url)
+    return normalized_url
+
+
+def is_github_dotcom_api_url(api_url: str) -> bool:
+    """Return True when the configured API URL targets public github.com."""
+    return urlsplit(rest_api_base_url(api_url)).netloc == "api.github.com"
+
+
+def github_org_url(api_url: str, organization: str) -> str:
+    """
+    Return the browser URL GitHub GraphQL reports for an organization.
+
+    GitHubOrganization.id is sourced from GraphQL ``organization.url``. REST-only
+    syncs must derive the same value from the configured API URL so GitHub
+    Enterprise resources attach to the correct organization node.
+    """
+    parsed = urlsplit(api_url.rstrip("/"))
+    if parsed.netloc == "api.github.com":
+        return f"https://github.com/{quote(organization, safe='')}"
+
+    path = parsed.path.rstrip("/")
+    for suffix in ("/api/graphql", "/api/v3", "/graphql"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    path = f"{path.rstrip('/')}/{quote(organization, safe='')}"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def handle_rest_rate_limit_sleep(token: str, base_url: str) -> None:
+    """
+    Check the remaining REST API rate limit and sleep if remaining is below threshold.
+
+    :param token: The GitHub API token as string.
+    :param base_url: The REST API base URL.
+    """
+    rate_limit_url = f"{base_url}/rate_limit"
+    response = requests.get(
+        rate_limit_url,
+        headers={"Authorization": f"Bearer {_resolve_token(token)}"},
+        timeout=_TIMEOUT,
+    )
+    response.raise_for_status()
+    response_json = response.json()
+    rate_limit_obj = response_json["resources"]["core"]
+    remaining = rate_limit_obj["remaining"]
+    threshold = _REST_RATE_LIMIT_REMAINING_THRESHOLD
+    if remaining > threshold:
+        return
+    reset_at = datetime.fromtimestamp(rate_limit_obj["reset"], tz=tz.utc)
+    now = datetime.now(tz.utc)
+    sleep_duration = reset_at - now + timedelta(minutes=1)
+    logger.warning(
+        f"GitHub REST API rate limit has {remaining} remaining and is under threshold {threshold}, "
+        f"sleeping until reset at {reset_at} for {sleep_duration}",
+    )
+    time.sleep(sleep_duration.total_seconds())
+
+
+def fetch_all_rest_api_pages(
+    token: str,
+    base_url: str,
+    endpoint: str,
+    result_key: str,
+    retries: int = 5,
+    raise_on_status: tuple[int, ...] = (),
+    params: dict[str, Any] | None = None,
+    api_version: str = "2022-11-28",
+) -> list[dict[str, Any]]:
+    """
+    Fetch all pages from a GitHub REST API endpoint using Link header pagination.
+
+    :param token: The GitHub API token as string.
+    :param base_url: The REST API base URL (e.g., https://api.github.com).
+    :param endpoint: The API endpoint path (e.g., /repos/{owner}/{repo}/actions/workflows).
+    :param result_key: The key in the response JSON that contains the list of results
+                       (e.g., 'workflows', 'secrets', 'variables').
+    :param retries: Number of retries to perform on transient errors.
+    :param raise_on_status: HTTP statuses that the caller wants to handle itself
+                            instead of being silently converted to an empty list.
+                            By default 404 and 403 return ``[]`` (legacy behavior
+                            relied on by most callers); pass e.g. ``(403,)`` if
+                            the caller needs to distinguish "no data" from
+                            "missing scope" — for example to skip a cleanup
+                            that would otherwise reap previously-synced data.
+    :param params: Optional query parameters to send on the first paginated request.
+    :param api_version: GitHub REST API version header value.
+    :return: A list of all items from all pages.
+    """
+    results: list[dict[str, Any]] = []
+    url: str | None = f"{base_url}{endpoint}"
+    first_request = True
+    retry = 0
+
+    while url:
+        # Resolve token each iteration so AppCredential can refresh expired tokens
+        headers = {
+            "Authorization": f"Bearer {_resolve_token(token)}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": api_version,
+        }
+        exc: Any = None
+        try:
+            handle_rest_rate_limit_sleep(token, base_url)
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params if first_request else None,
+                timeout=_TIMEOUT,
+            )
+            response.raise_for_status()
+            first_request = False
+            retry = 0
+        except requests.exceptions.Timeout as err:
+            retry += 1
+            exc = err
+        except requests.exceptions.HTTPError as err:
+            status = err.response.status_code if err.response is not None else None
+            if status is not None and status in raise_on_status:
+                raise
+            # Handle 404 gracefully - resource may not exist (e.g., no environments)
+            if status == 404:
+                logger.debug(f"GitHub REST API: 404 for {url}, returning empty list")
+                return []
+            # Handle 403 gracefully
+            if status == 403:
+                logger.warning(
+                    f"GitHub REST API: 403 Forbidden for {url}. "
+                    "This is likely due to insufficient permissions. "
+                    "Skipping this resource and continuing.",
+                )
+                return []
+            retry += 1
+            exc = err
+        except requests.exceptions.ChunkedEncodingError as err:
+            retry += 1
+            exc = err
+        except requests.exceptions.ConnectionError as err:
+            retry += 1
+            exc = err
+
+        if retry >= retries:
+            logger.error(
+                f"GitHub REST API: Could not retrieve {url} after {retry} retries. Raising exception.",
+                exc_info=True,
+            )
+            raise exc
+        elif retry > 0:
+            time.sleep(2**retry)
+            continue
+
+        response_json = response.json()
+
+        # Some endpoints return a list directly, others wrap in an object
+        if isinstance(response_json, list):
+            results.extend(response_json)
+        elif result_key in response_json:
+            results.extend(response_json[result_key])
+        else:
+            logger.warning(
+                f"GitHub REST API: Expected key '{result_key}' not found in response from {url}",
+            )
+
+        # Parse Link header for pagination
+        url = None
+        link_header = response.headers.get("Link", "")
+        if link_header:
+            for link in link_header.split(","):
+                if 'rel="next"' in link:
+                    # Extract URL from <url>; rel="next"
+                    url = link.split(";")[0].strip().strip("<>")
+                    break
+
+    return results
+
+
+def parse_github_timestamp(value: str | None) -> datetime | None:
+    """
+    Parse an RFC 3339 timestamp as GitHub returns it, such as
+    ``2024-01-02T03:04:05Z``, into a timezone-aware datetime so Neo4j stores a
+    native temporal value. A missing value is None; a malformed value, a value
+    of another type, or one without a UTC offset raises, so a change in
+    GitHub's format is never mistaken for an absent field.
+    """
+    if value is None or value == "":
+        return None
+    parsed = isoparse(value)
+    if parsed.tzinfo is None:
+        raise ValueError(f"GitHub timestamp {value!r} has no UTC offset")
+    return parsed
+
+
+# GitHub answers 403 or 404 when the credential lacks the permission or scope for
+# a resource, and 422 when a feature cannot be read, such as Copilot billing on an
+# organization with a payment problem. Callers treat these as "unavailable" and
+# let every other failure propagate.
+UNAVAILABLE_STATUSES = (403, 404, 422)
+
+
+def _unavailable_status(
+    err: requests.exceptions.HTTPError,
+    unavailable: tuple[int, ...],
+) -> int | None:
+    """Return the status when it means the resource is unavailable, else re-raise."""
+    status = err.response.status_code if err.response is not None else None
+    if status not in unavailable:
+        raise err
+    return status
+
+
+def fetch_all_rest_api_pages_or_none(
+    token: str,
+    base_url: str,
+    endpoint: str,
+    result_key: str,
+    description: str,
+    unavailable: tuple[int, ...] = UNAVAILABLE_STATUSES,
+    **kwargs: Any,
+) -> list[dict[str, Any]] | None:
+    """
+    Fetch all pages like ``fetch_all_rest_api_pages``, but return None when GitHub
+    reports the listing as unavailable to the credential. Other failures propagate,
+    so a transient error never looks like an empty or denied listing.
+
+    :param description: Human-readable name of the listing for the log message.
+    :param unavailable: HTTP statuses that mean "unavailable" rather than failure.
+    """
+    try:
+        return fetch_all_rest_api_pages(
+            token,
+            base_url,
+            endpoint,
+            result_key,
+            raise_on_status=unavailable,
+            **kwargs,
+        )
+    except requests.exceptions.HTTPError as err:
+        status = _unavailable_status(err, unavailable)
+        logger.warning(
+            "Skipping GitHub %s (%s): HTTP %s. The credential may lack the "
+            "required permission, or the feature is not enabled.",
+            description,
+            endpoint,
+            status,
+        )
+        return None
+
+
+def call_github_rest_api_or_none(
+    endpoint: str,
+    token: str,
+    api_url: str,
+    description: str,
+    unavailable: tuple[int, ...] = UNAVAILABLE_STATUSES,
+) -> dict[str, Any] | None:
+    """
+    Call ``call_github_rest_api`` and return None when GitHub reports the resource
+    as unavailable to the credential. Other failures propagate.
+    """
+    try:
+        return call_github_rest_api(endpoint, token, api_url)
+    except requests.exceptions.HTTPError as err:
+        status = _unavailable_status(err, unavailable)
+        logger.warning(
+            "Skipping GitHub %s (%s): HTTP %s. The credential may lack the "
+            "required permission, or the feature is not enabled.",
+            description,
+            endpoint,
+            status,
+        )
+        return None
+
+
+def call_github_rest_api(
+    endpoint: str,
+    token: str,
+    api_url: str = "https://api.github.com",
+    params: dict[str, Any] | None = None,
+    retries: int = 5,
+) -> dict[str, Any]:
+    """
+    Calls the GitHub REST API and returns the JSON response.
+
+    :param endpoint: The REST API endpoint path (e.g., "/search/code", "/repos/owner/repo/contents/path")
+    :param token: The OAuth token for authentication
+    :param api_url: The GitHub API URL (GraphQL or REST base URL - will be converted as needed)
+    :param params: Optional query parameters for the request
+    :param retries: Number of retries to perform on transient errors.
+    :return: The JSON response as a dictionary
+    :raises requests.exceptions.HTTPError: If the request fails with a non-transient error or after all retries
+    """
+    # Use the helper to get correct REST API base URL (handles GitHub Enterprise correctly)
+    base_url = (
+        _get_rest_api_base_url(api_url)
+        if api_url.endswith("/graphql")
+        else api_url.rstrip("/")
+    )
+
+    url = f"{base_url}{endpoint}"
+    last_exc: Any = None
+
+    for attempt in range(max(retries, 1)):
+        # Resolve token each iteration so AppCredential can refresh expired tokens
+        headers = {
+            "Authorization": f"Bearer {_resolve_token(token)}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+        try:
+            response = requests.get(
+                url, headers=headers, params=params, timeout=_TIMEOUT
+            )
+
+            # Handle rate limiting for Search API
+            if "X-RateLimit-Remaining" in response.headers:
+                remaining = int(response.headers["X-RateLimit-Remaining"])
+                # Check if this is a search endpoint (stricter limits)
+                is_search = "/search/" in endpoint
+                threshold = (
+                    _SEARCH_RATE_LIMIT_REMAINING_THRESHOLD
+                    if is_search
+                    else _REST_RATE_LIMIT_REMAINING_THRESHOLD
+                )
+
+                if remaining < threshold:
+                    reset_timestamp = int(response.headers.get("X-RateLimit-Reset", 0))
+                    if reset_timestamp:
+                        reset_at = datetime.fromtimestamp(reset_timestamp, tz=tz.utc)
+                        now = datetime.now(tz.utc)
+                        sleep_duration = (
+                            reset_at - now + timedelta(seconds=10)
+                        )  # Add buffer
+                        if sleep_duration.total_seconds() > 0:
+                            logger.warning(
+                                f"GitHub REST API rate limit has {remaining} remaining (threshold: {threshold}), "
+                                f"sleeping until reset at {reset_at} for {sleep_duration}",
+                            )
+                            time.sleep(sleep_duration.total_seconds())
+
+            response.raise_for_status()
+            result: dict[str, Any] = response.json()
+            return result
+
+        except requests.exceptions.Timeout as err:
+            last_exc = err
+        except requests.exceptions.HTTPError as err:
+            if (
+                err.response is not None
+                and err.response.status_code not in _TRANSIENT_STATUS_CODES
+            ):
+                raise
+            last_exc = err
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ) as err:
+            last_exc = err
+
+        logger.warning(
+            "GitHub REST API: transient error for '%s' (attempt %d/%d): %s",
+            url,
+            attempt + 1,
+            retries,
+            last_exc,
+        )
+        if attempt < retries - 1:
+            time.sleep(2 ** (attempt + 1))
+
+    logger.error(
+        "GitHub REST API: Could not retrieve %s after %d retries. Raising exception.",
+        url,
+        retries,
+        exc_info=True,
+    )
+    raise last_exc
+
+
+def get_file_content(
+    token: str,
+    owner: str,
+    repo: str,
+    path: str,
+    ref: str = "HEAD",
+    base_url: str = "https://api.github.com",
+) -> str | None:
+    """
+    Download the content of a file from a GitHub repository using the Contents API.
+
+    :param token: The GitHub API token
+    :param owner: The repository owner
+    :param repo: The repository name
+    :param path: The path to the file within the repository
+    :param ref: The git reference (branch, tag, or commit SHA) to get the file from
+    :param base_url: The base URL for the GitHub API
+    :return: The file content as a string, or None if retrieval fails
+    """
+    endpoint = f"/repos/{owner}/{repo}/contents/{path}"
+    params: dict[str, Any] = {"ref": ref}
+
+    try:
+        response = call_github_rest_api(endpoint, token, base_url, params)
+
+        # The content is base64 encoded
+        if response.get("encoding") == "base64":
+            content_b64 = response.get("content", "")
+            # GitHub returns content with newlines for readability, remove them
+            content_b64 = content_b64.replace("\n", "")
+            content = base64.b64decode(content_b64).decode("utf-8")
+            return content
+
+        # If not base64 encoded, try to get raw content
+        return response.get("content")
+
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            logger.debug("File not found: %s/%s/%s", owner, repo, path)
+            return None
+        raise
+
+
+# --- GHCR (GitHub Container Registry) ---------------------------------------
+
+DEFAULT_GHCR_URL = "https://ghcr.io"
+GHCR_MANIFEST_ACCEPT_HEADER = ", ".join(
+    [
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.oci.image.index.v1+json",
+    ],
+)
+
+
+def _ghcr_auth_header(token: Any) -> str:
+    """
+    Build the Authorization header value for GHCR's OCI Distribution API.
+
+    GHCR is an unusual OCI registry: instead of the standard token-exchange
+    flow, GitHub documents a shortcut where the PAT is base64-encoded and
+    sent as a Bearer credential.
+
+    See: https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry
+
+    Sending the raw PAT (as on the REST API) returns 403 from
+    ``ghcr.io/v2/...`` even with ``read:packages`` granted.
+    """
+    raw = _resolve_token(token).encode("utf-8")
+    return f"Bearer {base64.b64encode(raw).decode('ascii')}"
+
+
+def fetch_ghcr_manifest(
+    token: Any,
+    repository_name: str,
+    reference: str,
+    registry_url: str = DEFAULT_GHCR_URL,
+    retries: int = 3,
+) -> dict[str, Any] | None:
+    """
+    Fetch an OCI manifest (or manifest list) from GHCR.
+
+    :param token: GitHub PAT or AppCredential with read:packages.
+    :param repository_name: Path under the registry, e.g. "myorg/myimage".
+    :param reference: Manifest digest (sha256:...) or tag.
+    :param registry_url: Registry base URL (defaults to ghcr.io).
+    :param retries: Transient-error retry count.
+    :return: Parsed manifest dict or None when the manifest does not exist (404).
+    """
+    url = f"{registry_url.rstrip('/')}/v2/{repository_name}/manifests/{reference}"
+    last_exc: Any = None
+    for attempt in range(max(retries, 1)):
+        headers = {
+            "Authorization": _ghcr_auth_header(token),
+            "Accept": GHCR_MANIFEST_ACCEPT_HEADER,
+        }
+        try:
+            response = requests.get(url, headers=headers, timeout=_TIMEOUT)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            result: dict[str, Any] = response.json()
+            return result
+        except requests.exceptions.Timeout as err:
+            last_exc = err
+        except requests.exceptions.HTTPError as err:
+            if (
+                err.response is not None
+                and err.response.status_code not in _TRANSIENT_STATUS_CODES
+            ):
+                raise
+            last_exc = err
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ) as err:
+            last_exc = err
+
+        logger.warning(
+            "GHCR manifest fetch transient error for %s (attempt %d/%d): %s",
+            url,
+            attempt + 1,
+            retries,
+            last_exc,
+        )
+        if attempt < retries - 1:
+            time.sleep(2 ** (attempt + 1))
+
+    raise last_exc
+
+
+def fetch_ghcr_blob(
+    token: Any,
+    repository_name: str,
+    blob_digest: str,
+    registry_url: str = DEFAULT_GHCR_URL,
+    retries: int = 3,
+) -> dict[str, Any] | None:
+    """
+    Fetch a config blob (typically the OCI image config JSON) from GHCR.
+
+    Returns the parsed JSON or None on 404. Raises on non-transient HTTP
+    errors. Used by the GHCR sync to pull `layer_diff_ids`, architecture and
+    OS from the config that the manifest references.
+    """
+    url = f"{registry_url.rstrip('/')}/v2/{repository_name}/blobs/{blob_digest}"
+    last_exc: Any = None
+    for attempt in range(max(retries, 1)):
+        headers = {"Authorization": _ghcr_auth_header(token)}
+        try:
+            response = requests.get(url, headers=headers, timeout=_TIMEOUT)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            result: dict[str, Any] = response.json()
+            return result
+        except requests.exceptions.Timeout as err:
+            last_exc = err
+        except requests.exceptions.HTTPError as err:
+            if (
+                err.response is not None
+                and err.response.status_code not in _TRANSIENT_STATUS_CODES
+            ):
+                raise
+            last_exc = err
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ) as err:
+            last_exc = err
+
+        logger.warning(
+            "GHCR blob fetch transient error for %s (attempt %d/%d): %s",
+            url,
+            attempt + 1,
+            retries,
+            last_exc,
+        )
+        if attempt < retries - 1:
+            time.sleep(2 ** (attempt + 1))
+
+    raise last_exc

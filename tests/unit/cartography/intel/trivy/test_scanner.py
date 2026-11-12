@@ -1,0 +1,1416 @@
+import json
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+import pytest
+
+from cartography.intel.common.object_store import ObjectStoreError
+from cartography.intel.common.object_store import ReportRef
+from cartography.intel.trivy import _prepare_trivy_data
+from cartography.intel.trivy import sync_trivy_from_report_reader
+from cartography.intel.trivy import sync_trivy_from_s3
+from cartography.intel.trivy.scanner import get_json_files_in_s3
+from cartography.intel.trivy.scanner import sync_single_filesystem_snapshot
+from cartography.intel.trivy.scanner import sync_single_image_from_s3
+from cartography.intel.trivy.scanner import transform_all_packages
+from cartography.intel.trivy.scanner import transform_scan_results
+
+
+@pytest.mark.parametrize(
+    "metadata, matches",
+    [
+        ({"FilesystemSnapshotId": "aws:ec2:i-01:rootfs"}, True),
+        ({}, False),
+        (None, False),
+        ("invalid-metadata", False),
+        ({"FilesystemSnapshotId": ""}, False),
+        ({"FilesystemSnapshotId": ["aws:ec2:i-01:rootfs"]}, False),
+        ({"FilesystemSnapshotId": "aws:ec2:i-unknown:rootfs"}, False),
+    ],
+)
+def test_prepare_trivy_vm_requires_existing_rootfs_target(metadata, matches, caplog):
+    # Arrange: even an image alias collision must not route a VM to an image.
+    trivy_data = {
+        "ArtifactType": "vm",
+        "ArtifactName": "ebs:snap-temporary",
+        "Metadata": metadata,
+    }
+
+    # Act
+    prepared = _prepare_trivy_data(
+        trivy_data,
+        image_uris={"ebs:snap-temporary"},
+        digest_aliases={},
+        filesystem_targets={},
+        rootfs_targets={"aws:ec2:i-01:rootfs"},
+        source="vm.json",
+    )
+
+    # Assert
+    if matches:
+        assert prepared == (trivy_data, None, ["aws:ec2:i-01:rootfs"])
+    else:
+        assert prepared is None
+        assert "Skipping Trivy VM report vm.json" in caplog.text
+
+
+def test_prepare_trivy_data_rejects_non_exact_filesystem_revision():
+    # Arrange
+    revision = "0123456789abcdef0123456789abcdef01234567"
+    trivy_data = {
+        "ArtifactType": "repository",
+        "Metadata": {
+            "RepoURL": "https://github.com/acme/api",
+            "Commit": "main",
+        },
+    }
+
+    # Act
+    prepared = _prepare_trivy_data(
+        trivy_data,
+        image_uris=set(),
+        digest_aliases={},
+        filesystem_targets={("acme/api", revision, None): ["snapshot-1"]},
+        rootfs_targets=set(),
+        source="repository.json",
+    )
+
+    # Assert
+    assert prepared is None
+
+
+def test_prepare_trivy_data_matches_filesystem_root_directory():
+    revision = "0123456789abcdef0123456789abcdef01234567"
+    trivy_data = {
+        "ArtifactType": "repository",
+        "Metadata": {
+            "RepoURL": "https://github.com/acme/api",
+            "Commit": revision,
+            "RootDirectory": "services/api",
+        },
+    }
+
+    prepared = _prepare_trivy_data(
+        trivy_data,
+        image_uris=set(),
+        digest_aliases={},
+        filesystem_targets={
+            ("acme/api", revision, "services/api"): ["snapshot-api"],
+            ("acme/api", revision, "services/web"): ["snapshot-web"],
+        },
+        rootfs_targets=set(),
+        source="repository.json",
+    )
+
+    assert prepared == (trivy_data, None, ["snapshot-api"])
+
+
+@patch("boto3.Session")
+def test_list_s3_scan_results_basic_match(mock_boto3_session):
+    """Test basic S3 object listing with matching ECR images."""
+    # Arrange
+    mock_boto3_session.return_value.client.return_value.get_paginator.return_value.paginate.return_value = [
+        {
+            "Contents": [
+                {
+                    "Key": "scan-results/123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest.json"
+                },
+                {
+                    "Key": "scan-results/123456789012.dkr.ecr.us-west-2.amazonaws.com/other-repo:v1.0.json"
+                },
+                {"Key": "scan-results/some-other-file.txt"},  # Should be ignored
+            ]
+        }
+    ]
+
+    # Act
+    result = get_json_files_in_s3(
+        s3_bucket="my-bucket",
+        s3_prefix="scan-results",
+        boto3_session=mock_boto3_session.return_value,
+    )
+
+    # Assert
+    assert len(result) == 2
+    expected_keys = {
+        "scan-results/123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest.json",
+        "scan-results/123456789012.dkr.ecr.us-west-2.amazonaws.com/other-repo:v1.0.json",
+    }
+    assert result == expected_keys
+
+    assert mock_boto3_session.return_value.client.call_count == 1
+    assert mock_boto3_session.return_value.client.call_args.args[0] == "s3"
+    mock_boto3_session.return_value.client.return_value.get_paginator.assert_called_once_with(
+        "list_objects_v2"
+    )
+    mock_boto3_session.return_value.client.return_value.get_paginator.return_value.paginate.assert_called_once_with(
+        Bucket="my-bucket", Prefix="scan-results"
+    )
+
+
+@patch("boto3.Session")
+def test_list_s3_scan_results_no_matches(mock_boto3_session):
+    """Test S3 object listing when no ECR images match."""
+    # Arrange
+    mock_boto3_session.return_value.client.return_value.get_paginator.return_value.paginate.return_value = [
+        {
+            "Contents": [
+                {"Key": "scan-results/some-other-image:latest.json"},
+                {"Key": "scan-results/another-image:v1.0.json"},
+            ]
+        }
+    ]
+
+    # Act
+    result = get_json_files_in_s3(
+        s3_bucket="my-bucket",
+        s3_prefix="scan-results",
+        boto3_session=mock_boto3_session.return_value,
+    )
+
+    # Assert
+    assert len(result) == 2
+    expected_keys = [
+        "scan-results/some-other-image:latest.json",
+        "scan-results/another-image:v1.0.json",
+    ]
+    assert sorted(result) == sorted(expected_keys)
+
+    assert mock_boto3_session.return_value.client.call_count == 1
+    assert mock_boto3_session.return_value.client.call_args.args[0] == "s3"
+    mock_boto3_session.return_value.client.return_value.get_paginator.assert_called_once_with(
+        "list_objects_v2"
+    )
+    mock_boto3_session.return_value.client.return_value.get_paginator.return_value.paginate.assert_called_once_with(
+        Bucket="my-bucket", Prefix="scan-results"
+    )
+
+
+@patch("boto3.Session")
+def test_list_s3_scan_results_empty_s3_response(mock_boto3_session):
+    """Test S3 object listing when S3 bucket is empty."""
+    # Arrange
+    mock_boto3_session.return_value.client.return_value.get_paginator.return_value.paginate.return_value = [
+        {}
+    ]  # No Contents key
+
+    # Act
+    result = get_json_files_in_s3(
+        s3_bucket="my-bucket",
+        s3_prefix="scan-results",
+        boto3_session=mock_boto3_session.return_value,
+    )
+
+    # Assert
+    assert len(result) == 0
+
+
+@patch("boto3.Session")
+def test_list_s3_scan_results_with_url_encoding(mock_boto3_session):
+    """Test S3 object listing with URL-encoded image URIs."""
+    # Arrange
+    mock_boto3_session.return_value.client.return_value.get_paginator.return_value.paginate.return_value = [
+        {
+            "Contents": [
+                {
+                    "Key": "scan-results/123456789012.dkr.ecr.us-east-1.amazonaws.com%2Fmy-repo%3Alatest.json"
+                },
+            ]
+        }
+    ]
+
+    # Act
+    result = get_json_files_in_s3(
+        s3_bucket="my-bucket",
+        s3_prefix="scan-results",
+        boto3_session=mock_boto3_session.return_value,
+    )
+
+    # Assert
+    assert len(result) == 1
+    expected_keys = [
+        "scan-results/123456789012.dkr.ecr.us-east-1.amazonaws.com%2Fmy-repo%3Alatest.json"
+    ]
+    assert sorted(result) == sorted(expected_keys)
+
+    assert mock_boto3_session.return_value.client.call_count == 1
+    assert mock_boto3_session.return_value.client.call_args.args[0] == "s3"
+    mock_boto3_session.return_value.client.return_value.get_paginator.assert_called_once_with(
+        "list_objects_v2"
+    )
+    mock_boto3_session.return_value.client.return_value.get_paginator.return_value.paginate.assert_called_once_with(
+        Bucket="my-bucket", Prefix="scan-results"
+    )
+
+
+@patch("boto3.Session")
+def test_list_s3_scan_results_s3_error(mock_boto3_session):
+    """Test S3 object listing when S3 API raises an exception."""
+    # Arrange
+    mock_boto3_session.return_value.client.return_value.get_paginator.side_effect = (
+        Exception("S3 API Error")
+    )
+
+    # Act & Assert
+    try:
+        get_json_files_in_s3(
+            s3_bucket="my-bucket",
+            s3_prefix="scan-results",
+            boto3_session=mock_boto3_session.return_value,
+        )
+        assert False, "Expected exception was not raised"
+    except Exception as e:
+        assert str(e) == "S3 API Error"
+
+
+@patch("cartography.intel.trivy.scanner.sync_single_image")
+@patch("boto3.Session")
+def test_sync_single_image_from_s3_handles_missing_results_key(
+    mock_boto3_session, mock_sync_single_image
+):
+    """Test that scan data without 'Results' key is handled gracefully.
+
+    Trivy scans for images with zero vulnerabilities may omit the 'Results' key
+    entirely instead of returning an empty array. This should be treated as
+    "no vulnerabilities found" rather than an error.
+    """
+    # Arrange
+    mock_neo4j_session = MagicMock()
+
+    s3_bucket = "test-bucket"
+    image_uri = "555666777888.dkr.ecr.ap-southeast-2.amazonaws.com/microservice:latest"
+    s3_object_key = f"{image_uri}.json"
+
+    # Scan data with Metadata but no Results key (clean image with no vulnerabilities)
+    mock_scan_data = {
+        "Metadata": {
+            "RepoDigests": [
+                f"{image_uri.split(':')[0]}@sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+            ]
+        }
+    }
+
+    mock_response_body = MagicMock()
+    mock_response_body.read.return_value.decode.return_value = json.dumps(
+        mock_scan_data
+    )
+    mock_boto3_session.return_value.client.return_value.get_object.return_value = {
+        "Body": mock_response_body
+    }
+
+    # Act
+    sync_single_image_from_s3(
+        mock_neo4j_session,
+        image_uri,
+        12345,  # update_tag
+        s3_bucket,
+        s3_object_key,
+        mock_boto3_session.return_value,
+    )
+
+    # Assert - sync_single_image should have been called with the scan data
+    mock_sync_single_image.assert_called_once_with(
+        mock_neo4j_session,
+        mock_scan_data,
+        image_uri,
+        12345,
+    )
+
+
+@patch("cartography.intel.trivy.scanner.sync_single_image")
+@patch("boto3.Session")
+def test_sync_single_image_from_s3_success(
+    mock_boto3_session,
+    mock_sync_single_image,
+):
+    # Arrange
+    mock_neo4j_session = MagicMock()
+
+    image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/test-app:v1.2.3"
+    update_tag = 12345
+    s3_bucket = "trivy-scan-results"
+    s3_object_key = f"{image_uri}.json"
+
+    # Mock S3 response
+    mock_scan_data = {
+        "Results": [
+            {
+                "Target": "test-app",
+                "Vulnerabilities": [
+                    {"VulnerabilityID": "CVE-2023-1234", "Severity": "HIGH"}
+                ],
+            }
+        ],
+        "Metadata": {
+            "RepoDigests": [
+                f"{image_uri.split(':')[0]}@sha256:abcd1234efgh5678abcd1234efgh5678abcd1234efgh5678abcd1234efgh5678"
+            ]
+        },
+    }
+
+    mock_response_body = MagicMock()
+    mock_response_body.read.return_value.decode.return_value = json.dumps(
+        mock_scan_data
+    )
+    mock_boto3_session.return_value.client.return_value.get_object.return_value = {
+        "Body": mock_response_body
+    }
+
+    # Act
+    sync_single_image_from_s3(
+        mock_neo4j_session,
+        image_uri,
+        update_tag,
+        s3_bucket,
+        s3_object_key,
+        mock_boto3_session.return_value,
+    )
+
+    # Assert
+    assert mock_boto3_session.return_value.client.call_count == 1
+    assert mock_boto3_session.return_value.client.call_args.args[0] == "s3"
+    mock_boto3_session.return_value.client.return_value.get_object.assert_called_once_with(
+        Bucket=s3_bucket, Key=s3_object_key
+    )
+
+    # Verify sync_single_image was called with the correct data
+    mock_sync_single_image.assert_called_once_with(
+        mock_neo4j_session,
+        mock_scan_data,
+        image_uri,
+        update_tag,
+    )
+
+
+@patch("boto3.Session")
+def test_sync_single_image_from_s3_read_error(mock_boto3_session):
+    # Arrange
+    mock_neo4j_session = MagicMock()
+
+    image_uri = "987654321098.dkr.ecr.eu-west-1.amazonaws.com/backend:latest"
+    update_tag = 67890
+    s3_bucket = "trivy-scan-results"
+    s3_object_key = f"{image_uri}.json"
+
+    # Mock S3 read error
+    from botocore.exceptions import ClientError
+
+    mock_boto3_session.return_value.client.return_value.get_object.side_effect = (
+        ClientError(
+            error_response={"Error": {"Code": "NoSuchKey", "Message": "Key not found"}},
+            operation_name="GetObject",
+        )
+    )
+
+    # Act & Assert
+    with pytest.raises(ObjectStoreError, match=f"s3://{s3_bucket}/{s3_object_key}"):
+        sync_single_image_from_s3(
+            mock_neo4j_session,
+            image_uri,
+            update_tag,
+            s3_bucket,
+            s3_object_key,
+            mock_boto3_session.return_value,
+        )
+
+    assert mock_boto3_session.return_value.client.call_count == 1
+    assert mock_boto3_session.return_value.client.call_args.args[0] == "s3"
+    mock_boto3_session.return_value.client.return_value.get_object.assert_called_once_with(
+        Bucket=s3_bucket, Key=s3_object_key
+    )
+
+
+@patch("cartography.intel.trivy.scanner.sync_single_image")
+@patch("boto3.Session")
+def test_sync_single_image_from_s3_transform_error(
+    mock_boto3_session,
+    mock_sync_single_image,
+):
+    # Arrange
+    mock_neo4j_session = MagicMock()
+
+    image_uri = "555666777888.dkr.ecr.ap-southeast-2.amazonaws.com/worker:sha256-def456"
+    update_tag = 11111
+    s3_bucket = "trivy-scan-results"
+    s3_object_key = f"{image_uri}.json"
+
+    # Mock successful S3 read
+    mock_scan_data = {
+        "Results": [{"Target": "worker", "Vulnerabilities": []}],
+        "Metadata": {
+            "RepoDigests": [
+                f"{image_uri.split(':')[0]}@sha256:def456ghi789def456ghi789def456ghi789def456ghi789def456ghi789def4"
+            ]
+        },
+    }
+
+    mock_response_body = MagicMock()
+    mock_response_body.read.return_value.decode.return_value = json.dumps(
+        mock_scan_data
+    )
+    mock_boto3_session.return_value.client.return_value.get_object.return_value = {
+        "Body": mock_response_body
+    }
+
+    # Mock transformation error in sync_single_image
+    mock_sync_single_image.side_effect = KeyError("Missing required field")
+
+    # Act & Assert
+    with pytest.raises(KeyError):
+        sync_single_image_from_s3(
+            mock_neo4j_session,
+            image_uri,
+            update_tag,
+            s3_bucket,
+            s3_object_key,
+            mock_boto3_session.return_value,
+        )
+
+    mock_sync_single_image.assert_called_once()
+
+
+@patch("cartography.intel.trivy.scanner.sync_single_image")
+@patch("boto3.Session")
+def test_sync_single_image_from_s3_load_error(
+    mock_boto3_session,
+    mock_sync_single_image,
+):
+    # Arrange
+    mock_neo4j_session = MagicMock()
+
+    image_uri = "111222333444.dkr.ecr.ca-central-1.amazonaws.com/api:v3.0.0-beta"
+    update_tag = 99999
+    s3_bucket = "trivy-scan-results"
+    s3_object_key = f"{image_uri}.json"
+
+    # Mock successful S3 read
+    mock_scan_data = {
+        "Results": [{"Target": "api", "Vulnerabilities": []}],
+        "Metadata": {
+            "RepoDigests": [
+                f"{image_uri.split(':')[0]}@sha256:beta123abc456beta123abc456beta123abc456beta123abc456beta123abc456"
+            ]
+        },
+    }
+
+    mock_response_body = MagicMock()
+    mock_response_body.read.return_value.decode.return_value = json.dumps(
+        mock_scan_data
+    )
+    mock_boto3_session.return_value.client.return_value.get_object.return_value = {
+        "Body": mock_response_body
+    }
+
+    # Mock load error in sync_single_image
+    mock_sync_single_image.side_effect = Exception("Database connection failed")
+
+    # Act & Assert
+    with pytest.raises(Exception, match="Database connection failed"):
+        sync_single_image_from_s3(
+            mock_neo4j_session,
+            image_uri,
+            update_tag,
+            s3_bucket,
+            s3_object_key,
+            mock_boto3_session.return_value,
+        )
+
+    mock_sync_single_image.assert_called_once()
+
+
+@patch("cartography.intel.trivy._get_scan_targets_and_aliases")
+@patch("cartography.intel.trivy.S3BucketReader.list_reports")
+def test_sync_trivy_from_s3_no_matches(
+    mock_list_objects,
+    mock_get_targets_and_aliases,
+):
+    """Test that sync_trivy_from_s3 raises when no JSON files are present."""
+    mock_get_targets_and_aliases.return_value = (
+        {"987654321098.dkr.ecr.us-east-1.amazonaws.com/my-repo:4e380d"},
+        {},
+    )
+    mock_list_objects.return_value = []  # No scan results available
+
+    with pytest.raises(ValueError, match="No json scan results found in report source"):
+        sync_trivy_from_s3(
+            neo4j_session=MagicMock(),
+            trivy_s3_bucket="test-bucket",
+            trivy_s3_prefix="trivy-scans/",
+            update_tag=123,
+            common_job_parameters={},
+            boto3_session=MagicMock(),
+        )
+
+
+@patch("cartography.intel.trivy.cleanup")
+@patch("cartography.intel.trivy.sync_single_image")
+@patch("cartography.intel.trivy._get_scan_targets_and_aliases")
+@patch("cartography.intel.trivy.S3BucketReader.list_reports")
+@patch("boto3.Session")
+def test_sync_trivy_from_s3_digest_files(
+    mock_boto_session,
+    mock_list_objects,
+    mock_get_targets_and_aliases,
+    mock_sync_single_image,
+    mock_cleanup,
+):
+    """Ensure digest-named files are processed and mapped to the tag URI."""
+    display_uri = "123456789012.dkr.ecr.us-west-2.amazonaws.com/app:1.2.3"
+    digest_uri = (
+        "123456789012.dkr.ecr.us-west-2.amazonaws.com/app@sha256:abcdefabcdefabcdef"
+    )
+
+    mock_get_targets_and_aliases.return_value = (
+        {display_uri},
+        {digest_uri: display_uri},
+    )
+    mock_list_objects.return_value = [
+        ReportRef(
+            uri="s3://test-bucket/trivy-scans/app@sha256abcdef.json",
+            name="trivy-scans/app@sha256abcdef.json",
+        ),
+    ]
+
+    scan_payload = {
+        "ArtifactName": digest_uri,
+        "Metadata": {
+            "RepoDigests": [digest_uri],
+            "RepoTags": [],
+            "SubImagePlatforms": ["linux/amd64"],
+        },
+        "Results": [{"Target": "app", "Vulnerabilities": []}],
+    }
+
+    body = MagicMock()
+    body.read.return_value.decode.return_value = json.dumps(scan_payload)
+    mock_boto_session.return_value.client.return_value.get_object.return_value = {
+        "Body": body
+    }
+
+    sync_trivy_from_s3(
+        neo4j_session=MagicMock(),
+        trivy_s3_bucket="test-bucket",
+        trivy_s3_prefix="trivy-scans/",
+        update_tag=123,
+        common_job_parameters={},
+        boto3_session=mock_boto_session.return_value,
+    )
+
+    mock_sync_single_image.assert_called_once()
+    normalized_payload = mock_sync_single_image.call_args[0][1]
+    assert normalized_payload["ArtifactName"] == digest_uri
+
+
+@patch("cartography.intel.trivy.cleanup")
+@patch("cartography.intel.trivy._get_scan_targets_and_aliases")
+def test_sync_trivy_from_report_reader_skips_cleanup_after_parse_failure(
+    mock_get_targets_and_aliases,
+    mock_cleanup,
+):
+    mock_get_targets_and_aliases.return_value = (
+        {"123456789012.dkr.ecr.us-west-2.amazonaws.com/app:latest"},
+        {},
+    )
+    reader = MagicMock()
+    reader.source_uri = "s3://example-bucket/reports/trivy/"
+    reader.list_reports.return_value = [
+        ReportRef(
+            "s3://example-bucket/reports/trivy/app.json",
+            "reports/trivy/app.json",
+        ),
+    ]
+    reader.read_bytes.return_value = b"{not-json"
+
+    sync_trivy_from_report_reader(
+        neo4j_session=MagicMock(),
+        reader=reader,
+        update_tag=123,
+        common_job_parameters={},
+    )
+
+    mock_cleanup.assert_not_called()
+
+
+@patch("cartography.intel.trivy.sync_single_image")
+@patch("cartography.intel.trivy.cleanup")
+@patch("cartography.intel.trivy._get_scan_targets_and_aliases")
+def test_sync_trivy_skips_cleanup_when_some_reports_succeed_and_some_fail(
+    mock_get_targets_and_aliases,
+    mock_cleanup,
+    mock_sync_single_image,
+):
+    """If 1 report ingests cleanly but another fails to read, cleanup is skipped to preserve data."""
+    image_uri = "123456789012.dkr.ecr.us-west-2.amazonaws.com/app:latest"
+    mock_get_targets_and_aliases.return_value = ({image_uri}, {})
+
+    good_ref = ReportRef(
+        uri="s3://example-bucket/reports/trivy/good.json", name="good.json"
+    )
+    bad_ref = ReportRef(
+        uri="s3://example-bucket/reports/trivy/bad.json", name="bad.json"
+    )
+    good_payload = json.dumps(
+        {
+            "ArtifactName": image_uri,
+            "Metadata": {"RepoTags": [image_uri]},
+            "Results": [],
+        }
+    ).encode()
+
+    reader = MagicMock()
+    reader.source_uri = "s3://example-bucket/reports/trivy/"
+    reader.list_reports.return_value = [good_ref, bad_ref]
+    reader.read_bytes.side_effect = lambda ref: (
+        good_payload if ref.name == "good.json" else b"{not-json"
+    )
+
+    sync_trivy_from_report_reader(
+        neo4j_session=MagicMock(),
+        reader=reader,
+        update_tag=123,
+        common_job_parameters={},
+    )
+
+    mock_sync_single_image.assert_called_once()
+    mock_cleanup.assert_not_called()
+
+
+@patch("cartography.intel.trivy.sync_single_image")
+@patch("cartography.intel.trivy.cleanup")
+@patch("cartography.intel.trivy._get_scan_targets_and_aliases")
+def test_sync_trivy_skips_cleanup_when_no_reports_match_graph(
+    mock_get_targets_and_aliases,
+    mock_cleanup,
+    mock_sync_single_image,
+):
+    """If reads succeed but no reports match an image in the graph, cleanup is skipped."""
+    mock_get_targets_and_aliases.return_value = (
+        {"some-other-image:tag"},
+        {},
+    )
+
+    reader = MagicMock()
+    reader.source_uri = "s3://example-bucket/reports/trivy/"
+    reader.list_reports.return_value = [
+        ReportRef(
+            uri="s3://example-bucket/reports/trivy/orphan.json",
+            name="orphan.json",
+        )
+    ]
+    reader.read_bytes.return_value = json.dumps(
+        {
+            "ArtifactName": "unknown-image:tag",
+            "Metadata": {"RepoTags": ["unknown-image:tag"]},
+            "Results": [],
+        }
+    ).encode()
+
+    sync_trivy_from_report_reader(
+        neo4j_session=MagicMock(),
+        reader=reader,
+        update_tag=123,
+        common_job_parameters={},
+    )
+
+    mock_sync_single_image.assert_not_called()
+    mock_cleanup.assert_not_called()
+
+
+@patch("cartography.intel.trivy.sync_single_filesystem_snapshot")
+@patch("cartography.intel.trivy.cleanup")
+@patch("cartography.intel.trivy._get_filesystem_scan_targets")
+@patch("cartography.intel.trivy._get_scan_targets_and_aliases")
+@pytest.mark.parametrize(
+    "artifact_type,cleaned_snapshot_ids",
+    [("repository", ["snapshot-1"]), ("vm", ["aws:ec2:i-01:rootfs"])],
+)
+def test_filesystem_only_reports_preserve_existing_image_scan_data(
+    mock_get_targets_and_aliases,
+    mock_get_filesystem_targets,
+    mock_cleanup,
+    mock_sync_filesystem,
+    artifact_type,
+    cleaned_snapshot_ids,
+):
+    # Arrange
+    revision = "a" * 40
+    mock_get_targets_and_aliases.return_value = ({"registry.example/app:latest"}, {})
+    mock_get_filesystem_targets.return_value = {
+        ("owner/repo", revision, None): ["snapshot-1"]
+    }
+    reader = MagicMock()
+    reader.source_uri = "memory://trivy"
+    reader.list_reports.return_value = [
+        ReportRef(uri="memory://filesystem.json", name="filesystem.json")
+    ]
+    reader.read_bytes.return_value = json.dumps(
+        {
+            "ArtifactType": artifact_type,
+            "Metadata": {
+                "RepoURL": "https://github.com/owner/repo",
+                "Commit": revision,
+                "FilesystemSnapshotId": "aws:ec2:i-01:rootfs",
+            },
+            "Results": [],
+        }
+    ).encode()
+
+    neo4j_session = MagicMock()
+
+    # Act
+    with (
+        patch(
+            "cartography.intel.trivy.cleanup_filesystem_snapshot_relationships"
+        ) as mock_filesystem_cleanup,
+        patch(
+            "cartography.intel.trivy._get_rootfs_scan_targets",
+            return_value={"aws:ec2:i-01:rootfs": True},
+        ),
+    ):
+        sync_trivy_from_report_reader(
+            neo4j_session=neo4j_session,
+            reader=reader,
+            update_tag=123,
+            common_job_parameters={"UPDATE_TAG": 123},
+        )
+
+    # Assert
+    mock_sync_filesystem.assert_called_once()
+    mock_cleanup.assert_not_called()
+    mock_filesystem_cleanup.assert_called_once_with(
+        neo4j_session, 123, snapshot_ids=cleaned_snapshot_ids
+    )
+
+
+@patch("cartography.intel.trivy.sync_single_image")
+@patch("cartography.intel.trivy.cleanup")
+@patch("cartography.intel.trivy._get_filesystem_scan_targets")
+@patch("cartography.intel.trivy._get_scan_targets_and_aliases")
+@pytest.mark.parametrize(
+    "has_source_targets,has_rootfs_targets",
+    [(True, False), (True, True), (False, True)],
+)
+def test_image_only_report_cleanup_depends_on_source_targets(
+    mock_get_targets_and_aliases,
+    mock_get_filesystem_targets,
+    mock_cleanup,
+    mock_sync_image,
+    has_source_targets,
+    has_rootfs_targets,
+):
+    # Arrange
+    image_uri = "registry.example/app:latest"
+    mock_get_targets_and_aliases.return_value = ({image_uri}, {})
+    mock_get_filesystem_targets.return_value = (
+        {("owner/repo", "a" * 40, None): ["snapshot-1"]} if has_source_targets else {}
+    )
+    reader = MagicMock()
+    reader.source_uri = "memory://trivy"
+    reader.list_reports.return_value = [
+        ReportRef(uri="memory://image.json", name="image.json")
+    ]
+    reader.read_bytes.return_value = json.dumps(
+        {
+            "ArtifactName": image_uri,
+            "Metadata": {"RepoTags": [image_uri]},
+            "Results": [],
+        }
+    ).encode()
+    neo4j_session = MagicMock()
+
+    # Act
+    with (
+        patch(
+            "cartography.intel.trivy.cleanup_image_relationships"
+        ) as mock_image_cleanup,
+        patch(
+            "cartography.intel.trivy.cleanup_filesystem_snapshot_relationships"
+        ) as mock_filesystem_cleanup,
+        patch(
+            "cartography.intel.trivy._get_rootfs_scan_targets",
+            return_value=({"aws:ec2:i-01:rootfs": False} if has_rootfs_targets else {}),
+        ),
+    ):
+        sync_trivy_from_report_reader(
+            neo4j_session=neo4j_session,
+            reader=reader,
+            update_tag=123,
+            common_job_parameters={"UPDATE_TAG": 123},
+        )
+
+    # Assert
+    mock_sync_image.assert_called_once()
+    mock_filesystem_cleanup.assert_not_called()
+    if has_source_targets:
+        mock_cleanup.assert_not_called()
+        mock_image_cleanup.assert_called_once_with(neo4j_session, 123)
+    else:
+        mock_cleanup.assert_called_once_with(neo4j_session, {"UPDATE_TAG": 123})
+        mock_image_cleanup.assert_not_called()
+
+
+@patch("cartography.intel.trivy.scanner._sync_scan_results")
+def test_filesystem_scan_accepts_null_results(mock_sync_scan_results):
+    mock_sync_scan_results.return_value = 0
+
+    sync_single_filesystem_snapshot(
+        MagicMock(),
+        {"ArtifactType": "repository", "Results": None},
+        ["snapshot-1"],
+        "memory://clean.json",
+        123,
+    )
+
+    assert mock_sync_scan_results.call_args.args[1] == []
+
+
+def test_transform_scan_results_only_sets_cve_id_for_cves():
+    """Only CVE ids populate cve_id, in canonical form; GHSA ids land in ghsa_id."""
+    # Arrange
+    results = [
+        {
+            "Class": "os-pkgs",
+            "Type": "debian",
+            "Vulnerabilities": [
+                {
+                    "VulnerabilityID": "CVE-2024-11111",
+                    "PkgName": "openssl",
+                    "InstalledVersion": "3.0.15-1~deb12u1",
+                    "Severity": "HIGH",
+                },
+                {
+                    "VulnerabilityID": "GHSA-aaaa-bbbb-cccc",
+                    "PkgName": "h11",
+                    "InstalledVersion": "0.14.0",
+                    "Severity": "MEDIUM",
+                },
+                {
+                    "VulnerabilityID": "TEMP-0000000-ABCDEF",
+                    "PkgName": "liblzma5",
+                    "InstalledVersion": "5.4.1-0.2",
+                    "Severity": "LOW",
+                },
+                {
+                    "VulnerabilityID": "CVE-2026-1965_1",
+                    "PkgName": "curl",
+                    "InstalledVersion": "8.14.1-r2",
+                    "Severity": "UNKNOWN",
+                },
+            ],
+        },
+    ]
+
+    # Act
+    findings_list, _, _ = transform_scan_results(results, "sha256:testdigest")
+
+    # Assert
+    findings_by_id = {finding["id"]: finding for finding in findings_list}
+    assert set(findings_by_id) == {
+        "TIF|CVE-2024-11111",
+        "TIF|GHSA-aaaa-bbbb-cccc",
+        "TIF|TEMP-0000000-ABCDEF",
+        "TIF|CVE-2026-1965_1",
+    }
+
+    cve = findings_by_id["TIF|CVE-2024-11111"]
+    assert cve["cve_id"] == "CVE-2024-11111"
+    assert cve["ghsa_id"] is None
+    assert cve["has_cve"] == "true"
+
+    ghsa = findings_by_id["TIF|GHSA-aaaa-bbbb-cccc"]
+    assert ghsa["cve_id"] is None
+    assert ghsa["ghsa_id"] == "GHSA-aaaa-bbbb-cccc"
+    assert ghsa["has_cve"] == "false"
+
+    temp = findings_by_id["TIF|TEMP-0000000-ABCDEF"]
+    assert temp["cve_id"] is None
+    assert temp["ghsa_id"] is None
+    assert temp["has_cve"] == "false"
+
+    # Alpine's per-patch suffix is dropped from cve_id but kept on the node id
+    alpine = findings_by_id["TIF|CVE-2026-1965_1"]
+    assert alpine["cve_id"] == "CVE-2026-1965"
+    assert alpine["has_cve"] == "true"
+    assert alpine["vulnerability_ids"] == ["CVE-2026-1965_1"]
+
+    # The raw identifier stays available on name regardless of its scheme
+    assert {finding["VulnerabilityID"] for finding in findings_list} == {
+        "CVE-2024-11111",
+        "GHSA-aaaa-bbbb-cccc",
+        "TEMP-0000000-ABCDEF",
+        "CVE-2026-1965_1",
+    }
+
+
+def test_transform_scan_results_classifies_vendor_ids():
+    """Identifiers are picked up from VendorIDs too, not just the primary id."""
+    # Arrange - in practice VendorIDs carries vendor advisory ids (RHSA-, DSA-), which
+    # match neither scheme, but the classification does not assume that.
+    results = [
+        {
+            "Class": "os-pkgs",
+            "Type": "debian",
+            "Vulnerabilities": [
+                {
+                    "VulnerabilityID": "CVE-2025-31115",
+                    "VendorIDs": ["DSA-5895-1"],
+                    "PkgName": "liblzma5",
+                    "InstalledVersion": "5.4.1-0.2",
+                    "Severity": "HIGH",
+                },
+                {
+                    "VulnerabilityID": "DSA-5895-1",
+                    "VendorIDs": ["CVE-2025-31115", "GHSA-dddd-eeee-ffff"],
+                    "PkgName": "liblzma5",
+                    "InstalledVersion": "5.4.1-0.2",
+                    "Severity": "HIGH",
+                },
+            ],
+        },
+    ]
+
+    # Act
+    findings_list, _, _ = transform_scan_results(results, "sha256:testdigest")
+
+    # Assert
+    findings_by_id = {finding["id"]: finding for finding in findings_list}
+
+    # A vendor advisory id alongside a CVE changes the classification not at all, but is
+    # still preserved on the finding
+    cve = findings_by_id["TIF|CVE-2025-31115"]
+    assert cve["cve_id"] == "CVE-2025-31115"
+    assert cve["ghsa_id"] is None
+    assert cve["has_cve"] == "true"
+    assert cve["vulnerability_ids"] == ["CVE-2025-31115", "DSA-5895-1"]
+
+    # An identifier reported under VendorIDs is still classified, and id/name keep
+    # tracking the primary identifier
+    vendor_primary = findings_by_id["TIF|DSA-5895-1"]
+    assert vendor_primary["VulnerabilityID"] == "DSA-5895-1"
+    assert vendor_primary["cve_id"] == "CVE-2025-31115"
+    assert vendor_primary["ghsa_id"] == "GHSA-dddd-eeee-ffff"
+    assert vendor_primary["has_cve"] == "true"
+    # Primary first, then the vendor ids in report order
+    assert vendor_primary["vulnerability_ids"] == [
+        "DSA-5895-1",
+        "CVE-2025-31115",
+        "GHSA-dddd-eeee-ffff",
+    ]
+
+
+def test_transform_scan_results_dedupes_vulnerability_ids():
+    """A VendorIDs entry repeating the primary id is not duplicated in the list."""
+    # Arrange
+    results = [
+        {
+            "Class": "os-pkgs",
+            "Type": "debian",
+            "Vulnerabilities": [
+                {
+                    "VulnerabilityID": "CVE-2025-31115",
+                    "VendorIDs": ["CVE-2025-31115", "DSA-5895-1"],
+                    "PkgName": "liblzma5",
+                    "InstalledVersion": "5.4.1-0.2",
+                    "Severity": "HIGH",
+                },
+            ],
+        },
+    ]
+
+    # Act
+    findings_list, _, _ = transform_scan_results(results, "sha256:testdigest")
+
+    # Assert
+    assert findings_list[0]["vulnerability_ids"] == ["CVE-2025-31115", "DSA-5895-1"]
+
+
+def _vulnerability(
+    pkg_name: str,
+    severity: str,
+    severity_source: str | None,
+    status: str,
+) -> dict:
+    return {
+        "VulnerabilityID": "CVE-2023-4039",
+        "PkgName": pkg_name,
+        "InstalledVersion": "1.0.0",
+        "Severity": severity,
+        "SeveritySource": severity_source,
+        "Status": status,
+        "DataSource": {"ID": f"{pkg_name}-db"},
+    }
+
+
+def _os_packages(*vulnerabilities: dict) -> dict:
+    return {
+        "Class": "os-pkgs",
+        "Type": "debian",
+        "Vulnerabilities": list(vulnerabilities),
+    }
+
+
+def _language_packages(*vulnerabilities: dict) -> dict:
+    return {
+        "Class": "lang-pkgs",
+        "Type": "pip",
+        "Vulnerabilities": list(vulnerabilities),
+    }
+
+
+def _target_ratings(findings_list: list[dict]) -> list[tuple]:
+    return [
+        (
+            row["TargetSeverity"],
+            row["TargetSeveritySource"],
+            row["TargetStatus"],
+            row["TargetDataSourceID"],
+        )
+        for row in findings_list
+    ]
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("low-package", "LOW", "debian", "affected"),
+                    _vulnerability("high-package", "HIGH", "nvd", "fixed"),
+                ),
+            ],
+            id="most-severe-last",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("high-package", "HIGH", "nvd", "fixed"),
+                    _vulnerability("low-package", "LOW", "debian", "affected"),
+                ),
+            ],
+            id="most-severe-first",
+        ),
+    ],
+)
+def test_transform_scan_results_rates_a_finding_by_its_most_severe_package(results):
+    # Act
+    findings_list, _, _ = transform_scan_results(results, "sha256:testdigest")
+
+    # Assert
+    assert _target_ratings(findings_list) == [
+        ("HIGH", "nvd", "fixed", "high-package-db"),
+        ("HIGH", "nvd", "fixed", "high-package-db"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "results, expected_rating",
+    [
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("nvd-rated", "MEDIUM", "nvd", "affected"),
+                    _vulnerability("vendor-rated", "MEDIUM", "debian", "affected"),
+                ),
+            ],
+            ("MEDIUM", "debian", "affected", "vendor-rated-db"),
+            id="named-source-after-nvd",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("vendor-rated", "MEDIUM", "debian", "affected"),
+                    _vulnerability("nvd-rated", "MEDIUM", "nvd", "affected"),
+                ),
+            ],
+            ("MEDIUM", "debian", "affected", "vendor-rated-db"),
+            id="named-source-before-nvd",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("unsourced", "MEDIUM", None, "affected"),
+                    _vulnerability("vendor-rated", "MEDIUM", "ubuntu", "affected"),
+                ),
+            ],
+            ("MEDIUM", "ubuntu", "affected", "vendor-rated-db"),
+            id="named-source-after-unsourced",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("unsourced", "MEDIUM", None, "affected"),
+                    _vulnerability("nvd-rated", "MEDIUM", "nvd", "affected"),
+                ),
+            ],
+            ("MEDIUM", None, "affected", "unsourced-db"),
+            id="unsourced-ties-with-nvd-unsourced-first",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("nvd-rated", "MEDIUM", "nvd", "affected"),
+                    _vulnerability("unsourced", "MEDIUM", None, "affected"),
+                ),
+            ],
+            ("MEDIUM", "nvd", "affected", "nvd-rated-db"),
+            id="unsourced-ties-with-nvd-nvd-first",
+        ),
+    ],
+)
+def test_transform_scan_results_prefers_a_named_severity_source_on_a_tie(
+    results,
+    expected_rating,
+):
+    # Act
+    findings_list, _, _ = transform_scan_results(results, "sha256:testdigest")
+
+    # Assert
+    assert _target_ratings(findings_list) == [expected_rating, expected_rating]
+
+
+@pytest.mark.parametrize(
+    "results, expected_rating",
+    [
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("fixable", "LOW", "debian", "fixed"),
+                    _vulnerability("unfixed", "LOW", "debian", "affected"),
+                ),
+            ],
+            ("LOW", "debian", "affected", "unfixed-db"),
+            id="affected-after-fixed",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("unfixed", "LOW", "debian", "affected"),
+                    _vulnerability("fixable", "LOW", "debian", "fixed"),
+                ),
+            ],
+            ("LOW", "debian", "affected", "unfixed-db"),
+            id="affected-before-fixed",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("fixable", "LOW", "debian", "fixed"),
+                    _vulnerability("unfixable", "LOW", "debian", "will_not_fix"),
+                ),
+            ],
+            ("LOW", "debian", "will_not_fix", "unfixable-db"),
+            id="will-not-fix-after-fixed",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("unaffected", "LOW", "debian", "not_affected"),
+                    _vulnerability("fixable", "LOW", "debian", "fixed"),
+                ),
+            ],
+            ("LOW", "debian", "fixed", "fixable-db"),
+            id="fixed-after-not-affected",
+        ),
+    ],
+)
+def test_transform_scan_results_prefers_no_fix_available_on_a_tie(
+    results,
+    expected_rating,
+):
+    # Act
+    findings_list, _, _ = transform_scan_results(results, "sha256:testdigest")
+
+    # Assert
+    assert _target_ratings(findings_list) == [expected_rating, expected_rating]
+
+
+@pytest.mark.parametrize(
+    "results, expected_rating",
+    [
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("os-package", "HIGH", "debian", "affected"),
+                ),
+                _language_packages(
+                    _vulnerability("language-package", "HIGH", "ghsa", "affected"),
+                ),
+            ],
+            ("HIGH", "debian", "affected", "os-package-db"),
+            id="os-package-first",
+        ),
+        pytest.param(
+            [
+                _language_packages(
+                    _vulnerability("language-package", "HIGH", "ghsa", "affected"),
+                ),
+                _os_packages(
+                    _vulnerability("os-package", "HIGH", "debian", "affected"),
+                ),
+            ],
+            ("HIGH", "debian", "affected", "os-package-db"),
+            id="language-package-first",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("alpha-package", "HIGH", "debian", "affected"),
+                    _vulnerability("beta-package", "HIGH", "debian", "affected"),
+                ),
+            ],
+            ("HIGH", "debian", "affected", "alpha-package-db"),
+            id="full-tie-alpha-reported-first",
+        ),
+        pytest.param(
+            [
+                _os_packages(
+                    _vulnerability("beta-package", "HIGH", "debian", "affected"),
+                    _vulnerability("alpha-package", "HIGH", "debian", "affected"),
+                ),
+            ],
+            ("HIGH", "debian", "affected", "beta-package-db"),
+            id="full-tie-beta-reported-first",
+        ),
+    ],
+)
+def test_transform_scan_results_prefers_os_packages_then_report_order_on_a_tie(
+    results,
+    expected_rating,
+):
+    # Act
+    findings_list, _, _ = transform_scan_results(results, "sha256:testdigest")
+
+    # Assert
+    assert _target_ratings(findings_list) == [expected_rating, expected_rating]
+
+
+def test_transform_scan_results_keeps_each_package_rating_on_its_finding_row():
+    # Arrange
+    results = [
+        _os_packages(
+            _vulnerability("low-package", "LOW", "debian", "affected"),
+            _vulnerability("high-package", "HIGH", "nvd", "fixed"),
+        ),
+    ]
+
+    # Act
+    findings_list, _, _ = transform_scan_results(results, "sha256:testdigest")
+
+    # Assert
+    assert [
+        (row["Severity"], row["SeveritySource"], row["Status"], row["DataSourceID"])
+        for row in findings_list
+    ] == [
+        ("LOW", "debian", "affected", "low-package-db"),
+        ("HIGH", "nvd", "fixed", "high-package-db"),
+    ]
+
+
+def _go_binary(target: str) -> dict:
+    return {
+        "Target": target,
+        "Class": "lang-pkgs",
+        "Type": "gobinary",
+        "Packages": [
+            {"Name": "stdlib", "Version": "v1.18.0"},
+            {"Name": "github.com/example/cli", "Version": "v1.2.0"},
+        ],
+        "Vulnerabilities": [
+            {
+                "VulnerabilityID": "CVE-2023-24538",
+                "PkgName": "stdlib",
+                "InstalledVersion": "v1.18.0",
+                "Severity": "CRITICAL",
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "results, expected_locations",
+    [
+        pytest.param(
+            [_go_binary("usr/local/bin/api"), _go_binary("opt/tools/worker")],
+            {
+                "v1.18.0|stdlib": ["opt/tools/worker", "usr/local/bin/api"],
+                "v1.2.0|github.com/example/cli": [
+                    "opt/tools/worker",
+                    "usr/local/bin/api",
+                ],
+            },
+            id="go-binaries",
+        ),
+        pytest.param(
+            [
+                {
+                    "Target": "Node.js",
+                    "Class": "lang-pkgs",
+                    "Type": "node-pkg",
+                    "Packages": [
+                        {
+                            "Name": "minimist",
+                            "Version": "1.2.5",
+                            "FilePath": "app/node_modules/minimist/package.json",
+                        },
+                        {"Name": "ms", "Version": "2.1.3"},
+                    ],
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2021-23337",
+                            "PkgName": "lodash",
+                            "InstalledVersion": "4.17.20",
+                            "PkgPath": "app/node_modules/lodash/package.json",
+                            "Severity": "HIGH",
+                        },
+                    ],
+                },
+            ],
+            {
+                "4.17.20|lodash": ["app/node_modules/lodash/package.json"],
+                "1.2.5|minimist": ["app/node_modules/minimist/package.json"],
+                "2.1.3|ms": None,
+            },
+            id="aggregated-ecosystem",
+        ),
+        pytest.param(
+            [
+                {
+                    "Target": "Kubernetes",
+                    "Class": "lang-pkgs",
+                    "Type": "kubernetes",
+                    "Packages": [{"Name": "k8s.io/kubelet", "Version": "1.29.0"}],
+                },
+            ],
+            {"1.29.0|k8s.io/kubelet": None},
+            id="kubernetes-components",
+        ),
+        pytest.param(
+            [
+                {
+                    "Target": "registry.example/app:latest (debian 12.8)",
+                    **_os_packages(
+                        _vulnerability("libc6", "HIGH", "debian", "affected"),
+                    ),
+                },
+            ],
+            {"1.0.0|libc6": None},
+            id="os-packages",
+        ),
+    ],
+)
+def test_transform_records_the_files_that_contain_each_package(
+    results, expected_locations
+):
+    # Act
+    _, packages, _ = transform_scan_results(results, "sha256:testdigest")
+    packages += transform_all_packages(
+        results,
+        "sha256:testdigest",
+        {package["id"] for package in packages},
+    )
+
+    # Assert
+    assert {
+        package["id"]: package["Locations"] for package in packages
+    } == expected_locations

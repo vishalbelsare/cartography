@@ -1,0 +1,51 @@
+VERCEL_PROJECTS = [
+    {
+        "id": "prj_abc",
+        "name": "acme-web",
+        "framework": "nextjs",
+        "nodeVersion": "20.x",
+        "buildCommand": "next build",
+        "devCommand": "next dev",
+        "installCommand": "npm install",
+        "outputDirectory": ".next",
+        "publicSource": False,
+        "serverlessFunctionRegion": "iad1",
+        "createdAt": 1640995200000,
+        "updatedAt": 1641081600000,
+        "autoExposeSystemEnvs": True,
+        "rootDirectory": "apps/web",
+        "gitForkProtection": True,
+        "skewProtectionMaxAge": 3600,
+        # Vercel Authentication covering every deployment, so nothing is public.
+        "ssoProtection": {"deploymentType": "all"},
+        "passwordProtection": None,
+        "trustedSources": None,
+    },
+    {
+        "id": "prj_def",
+        "name": "acme-docs",
+        "framework": "gatsby",
+        "nodeVersion": "18.x",
+        "buildCommand": "gatsby build",
+        "devCommand": "gatsby develop",
+        "installCommand": "yarn install",
+        "outputDirectory": "public",
+        "publicSource": True,
+        "serverlessFunctionRegion": "sfo1",
+        "createdAt": 1641000000000,
+        "updatedAt": 1641100000000,
+        "autoExposeSystemEnvs": False,
+        "rootDirectory": "apps/docs",
+        "gitForkProtection": False,
+        "skewProtectionMaxAge": 7200,
+        # SSO is preview-only, and password protection stops at the production deployment
+        # URLs. The password must never reach the graph. trustedSources is set to show it is
+        # not read: it is an OIDC authentication path, not an access restriction.
+        "ssoProtection": {"deploymentType": "preview"},
+        "passwordProtection": {
+            "deploymentType": "prod_deployment_urls_and_all_previews",
+            "password": "do-not-ingest-me",
+        },
+        "trustedSources": {"oidcProviders": {"acme-idp": []}},
+    },
+]

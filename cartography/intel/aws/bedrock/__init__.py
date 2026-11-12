@@ -1,0 +1,158 @@
+"""
+AWS Bedrock intel module.
+Ingests AWS Bedrock resources including foundation models, custom models,
+agents, knowledge bases, guardrails, and provisioned throughput.
+"""
+
+import logging
+from typing import Dict
+
+import boto3
+import neo4j
+
+from cartography.intel.aws.util.service_regions import (
+    filter_regions_to_supported_service_regions,
+)
+from cartography.util import timeit
+
+# Import sync functions from individual modules
+from . import agents
+from . import custom_models
+from . import foundation_models
+from . import guardrails
+from . import knowledge_bases
+from . import provisioned_model_throughput
+
+logger = logging.getLogger(__name__)
+
+# The Bedrock control plane supports us-west-1, but the Bedrock Agents
+# build-time API used for agents and knowledge bases does not.
+# https://docs.aws.amazon.com/general/latest/gr/bedrock.html
+UNSUPPORTED_BEDROCK_AGENT_REGIONS = {"us-west-1"}
+
+
+@timeit
+def sync(
+    neo4j_session: neo4j.Session,
+    boto3_session: boto3.session.Session,
+    regions: list[str],
+    current_aws_account_id: str,
+    update_tag: int,
+    common_job_parameters: Dict,
+) -> None:
+    """
+    Main sync function for AWS Bedrock resources.
+    Orchestrates ingestion of all Bedrock resource types.
+
+    :param neo4j_session: Neo4j session for database operations
+    :param boto3_session: Boto3 session for AWS API calls
+    :param regions: List of AWS regions to sync
+    :param current_aws_account_id: The AWS account ID being synced
+    :param update_tag: Timestamp tag for tracking data freshness
+    :param common_job_parameters: Common parameters for cleanup jobs
+    """
+    logger.info(
+        "Syncing AWS Bedrock resources for account %s across %d requested regions",
+        current_aws_account_id,
+        len(regions),
+    )
+
+    bedrock_regions, unsupported_bedrock_regions = (
+        filter_regions_to_supported_service_regions(
+            boto3_session,
+            "bedrock",
+            regions,
+        )
+    )
+    bedrock_agent_candidate_regions = [
+        region for region in regions if region not in UNSUPPORTED_BEDROCK_AGENT_REGIONS
+    ]
+    bedrock_agent_regions, unsupported_bedrock_agent_regions = (
+        filter_regions_to_supported_service_regions(
+            boto3_session,
+            "bedrock-agent",
+            bedrock_agent_candidate_regions,
+        )
+    )
+    unsupported_bedrock_agent_regions.extend(
+        region for region in regions if region in UNSUPPORTED_BEDROCK_AGENT_REGIONS
+    )
+
+    if unsupported_bedrock_regions:
+        logger.info(
+            "Skipping Bedrock sync for account %s in unsupported Bedrock regions: %s",
+            current_aws_account_id,
+            ", ".join(unsupported_bedrock_regions),
+        )
+
+    if unsupported_bedrock_agent_regions:
+        logger.info(
+            "Skipping Bedrock agent sync for account %s in unsupported Bedrock Agent regions: %s",
+            current_aws_account_id,
+            ", ".join(unsupported_bedrock_agent_regions),
+        )
+
+    # Sync foundation models
+    foundation_models.sync(
+        neo4j_session,
+        boto3_session,
+        bedrock_regions,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+
+    # Sync custom models
+    custom_models.sync(
+        neo4j_session,
+        boto3_session,
+        bedrock_regions,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+
+    # Sync guardrails
+    guardrails.sync(
+        neo4j_session,
+        boto3_session,
+        bedrock_regions,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+
+    # Sync knowledge bases (before agents, since agents can reference KBs)
+    # Melbourne's ListKnowledgeBases endpoint returns InternalServerException,
+    # while ListAgents succeeds. Keep this exclusion specific to knowledge bases.
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base-supported.html
+    knowledge_bases.sync(
+        neo4j_session,
+        boto3_session,
+        [region for region in bedrock_agent_regions if region != "ap-southeast-4"],
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+
+    # Sync agents (after KBs, foundation models, custom models, and guardrails)
+    agents.sync(
+        neo4j_session,
+        boto3_session,
+        bedrock_agent_regions,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+
+    # Sync provisioned model throughput
+    provisioned_model_throughput.sync(
+        neo4j_session,
+        boto3_session,
+        bedrock_regions,
+        current_aws_account_id,
+        update_tag,
+        common_job_parameters,
+    )
+
+    logger.info("Completed AWS Bedrock sync for account %s", current_aws_account_id)

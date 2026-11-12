@@ -2,6 +2,7 @@ import logging
 from typing import Any
 from typing import Dict
 from typing import Generator
+from typing import Iterable
 from typing import List
 from typing import Tuple
 
@@ -14,11 +15,133 @@ from azure.mgmt.sql.models import SecurityAlertPolicyName
 from azure.mgmt.sql.models import TransparentDataEncryptionName
 from msrestazure.azure_exceptions import CloudError
 
-from .util.credentials import Credentials
-from cartography.util import run_cleanup_job
+from cartography.client.core.tx import load
+from cartography.graph.job import GraphJob
+from cartography.intel.azure.util.tag import transform_tags
+from cartography.models.azure.sql.databasethreatdetectionpolicy import (
+    AzureDatabaseThreatDetectionPolicySchema,
+)
+from cartography.models.azure.sql.elasticpool import AzureElasticPoolSchema
+from cartography.models.azure.sql.failovergroup import AzureFailoverGroupSchema
+from cartography.models.azure.sql.recoverabledatabase import (
+    AzureRecoverableDatabaseSchema,
+)
+from cartography.models.azure.sql.replicationlink import AzureReplicationLinkSchema
+from cartography.models.azure.sql.restorabledroppeddatabase import (
+    AzureRestorableDroppedDatabaseSchema,
+)
+from cartography.models.azure.sql.restorepoint import AzureRestorePointSchema
+from cartography.models.azure.sql.serveradadministrator import (
+    AzureServerADAdministratorSchema,
+)
+from cartography.models.azure.sql.serverdnsalias import AzureServerDNSAliasSchema
+from cartography.models.azure.sql.sqldatabase import AzureSQLDatabaseSchema
+from cartography.models.azure.sql.sqlserver import AzureSQLServerSchema
+from cartography.models.azure.sql.sqlserver_firewall_rule import (
+    AzureSQLServerFirewallRuleSchema,
+)
+from cartography.models.azure.sql.transparentdataencryption import (
+    AzureTransparentDataEncryptionSchema,
+)
+from cartography.models.azure.tags.sql_tag import AzureSQLServerTagsSchema
 from cartography.util import timeit
 
+from .util.common import copy_properties
+from .util.credentials import Credentials
+
 logger = logging.getLogger(__name__)
+
+SQL_SERVER_PROPERTY_MAP = {
+    "state": ("state",),
+    "version": ("version",),
+    "public_network_access": ("public_network_access", "publicNetworkAccess"),
+    "minimal_tls_version": ("minimal_tls_version", "minimalTlsVersion"),
+}
+
+SQL_DATABASE_PROPERTY_MAP = {
+    "creation_date": ("creation_date", "creationDate"),
+    "database_id": ("database_id", "databaseId"),
+    "max_size_bytes": ("max_size_bytes", "maxSizeBytes"),
+    "license_type": ("license_type", "licenseType"),
+    "default_secondary_location": (
+        "default_secondary_location",
+        "defaultSecondaryLocation",
+    ),
+    "elastic_pool_id": ("elastic_pool_id", "elasticPoolId"),
+    "collation": ("collation",),
+    "failover_group_id": ("failover_group_id", "failoverGroupId"),
+    "zone_redundant": ("zone_redundant", "zoneRedundant"),
+    "restorable_dropped_database_id": (
+        "restorable_dropped_database_id",
+        "restorableDroppedDatabaseId",
+    ),
+    "recoverable_database_id": ("recoverable_database_id", "recoverableDatabaseId"),
+}
+
+SQL_FIREWALL_RULE_PROPERTY_MAP = {
+    "start_ip_address": ("start_ip_address", "startIpAddress"),
+    "end_ip_address": ("end_ip_address", "endIpAddress"),
+}
+
+SQL_DETAIL_PROPERTY_MAP = {
+    "administrator_type": ("administrator_type", "administratorType"),
+    "azure_dns_record": ("azure_dns_record", "azureDnsRecord"),
+    "creation_date": ("creation_date", "creationDate"),
+    "creation_time": ("creation_time", "creationTime"),
+    "database_name": ("database_name", "databaseName"),
+    "default_secondary_location": (
+        "default_secondary_location",
+        "defaultSecondaryLocation",
+    ),
+    "deletion_date": ("deletion_date", "deletionDate"),
+    "disabled_alerts": ("disabled_alerts", "disabledAlerts"),
+    "earliest_restore_date": ("earliest_restore_date", "earliestRestoreDate"),
+    "email_account_admins": ("email_account_admins", "emailAccountAdmins"),
+    "email_addresses": ("email_addresses", "emailAddresses"),
+    "is_termination_allowed": ("is_termination_allowed", "isTerminationAllowed"),
+    "last_available_backup_date": (
+        "last_available_backup_date",
+        "lastAvailableBackupDate",
+    ),
+    "license_type": ("license_type", "licenseType"),
+    "max_size_bytes": ("max_size_bytes", "maxSizeBytes"),
+    "partner_database": ("partner_database", "partnerDatabase"),
+    "partner_location": ("partner_location", "partnerLocation"),
+    "partner_role": ("partner_role", "partnerRole"),
+    "partner_server": ("partner_server", "partnerServer"),
+    "percent_complete": ("percent_complete", "percentComplete"),
+    "replication_mode": ("replication_mode", "replicationMode"),
+    "replication_role": ("replication_role", "replicationRole"),
+    "replication_state": ("replication_state", "replicationState"),
+    "restore_point_creation_date": (
+        "restore_point_creation_date",
+        "restorePointCreationDate",
+    ),
+    "restore_point_type": ("restore_point_type", "restorePointType"),
+    "retention_days": ("retention_days", "retentionDays"),
+    "service_level_objective": ("service_level_objective", "serviceLevelObjective"),
+    "start_time": ("start_time", "startTime"),
+    "state": ("state",),
+    "status": ("status",),
+    "storage_endpoint": ("storage_endpoint", "storageEndpoint"),
+    "zone_redundant": ("zone_redundant", "zoneRedundant"),
+}
+
+
+def transform_sql_server(server: Dict) -> Dict:
+    return copy_properties(server, SQL_SERVER_PROPERTY_MAP)
+
+
+def transform_sql_database(database: Dict) -> Dict:
+    return copy_properties(database, SQL_DATABASE_PROPERTY_MAP)
+
+
+def transform_sql_firewall_rule(rule: Dict) -> Dict:
+    return copy_properties(rule, SQL_FIREWALL_RULE_PROPERTY_MAP)
+
+
+def transform_sql_detail(data: Dict) -> Dict:
+    return copy_properties(data, SQL_DETAIL_PROPERTY_MAP)
 
 
 @timeit
@@ -37,7 +160,9 @@ def get_server_list(credentials: Credentials, subscription_id: str) -> List[Dict
     """
     try:
         client = get_client(credentials, subscription_id)
-        server_list = list(map(lambda x: x.as_dict(), client.servers.list()))
+        server_list = list(
+            map(lambda x: transform_sql_server(x.as_dict()), client.servers.list())
+        )
 
     # ClientAuthenticationError and ResourceNotFoundError are subclasses under HttpResponseError
     except ClientAuthenticationError as e:
@@ -51,49 +176,34 @@ def get_server_list(credentials: Credentials, subscription_id: str) -> List[Dict
         return []
 
     for server in server_list:
-        x = server['id'].split('/')
-        server['resourceGroup'] = x[x.index('resourceGroups') + 1]
-
+        x = server["id"].split("/")
+        server["resourceGroup"] = x[x.index("resourceGroups") + 1]
     return server_list
 
 
 @timeit
 def load_server_data(
-        neo4j_session: neo4j.Session, subscription_id: str, server_list: List[Dict],
-        azure_update_tag: int,
+    neo4j_session: neo4j.Session,
+    subscription_id: str,
+    server_list: List[Dict],
+    azure_update_tag: int,
 ) -> None:
-    """
-    Ingest the server details into neo4j.
-    """
-    ingest_server = """
-    UNWIND {server_list} as server
-    MERGE (s:AzureSQLServer{id: server.id})
-    ON CREATE SET s.firstseen = timestamp(),
-    s.resourcegroup = server.resourceGroup, s.location = server.location
-    SET s.lastupdated = {azure_update_tag},
-    s.name = server.name,
-    s.kind = server.kind,
-    s.state = server.state,
-    s.version = server.version
-    WITH s
-    MATCH (owner:AzureSubscription{id: {AZURE_SUBSCRIPTION_ID}})
-    MERGE (owner)-[r:RESOURCE]->(s)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_server,
-        server_list=server_list,
+    load(
+        neo4j_session,
+        AzureSQLServerSchema(),
+        server_list,
+        lastupdated=azure_update_tag,
         AZURE_SUBSCRIPTION_ID=subscription_id,
-        azure_update_tag=azure_update_tag,
     )
 
 
 @timeit
 def sync_server_details(
-        neo4j_session: neo4j.Session, credentials: Credentials, subscription_id: str,
-        server_list: List[Dict], sync_tag: int,
+    neo4j_session: neo4j.Session,
+    credentials: Credentials,
+    subscription_id: str,
+    server_list: List[Dict],
+    sync_tag: int,
 ) -> None:
     details = get_server_details(credentials, subscription_id, server_list)
     load_server_details(neo4j_session, credentials, subscription_id, details, sync_tag)
@@ -101,7 +211,9 @@ def sync_server_details(
 
 @timeit
 def get_server_details(
-        credentials: Credentials, subscription_id: str, server_list: List[Dict],
+    credentials: Credentials,
+    subscription_id: str,
+    server_list: List[Dict],
 ) -> Generator[Any, Any, Any]:
     """
     Iterate over each servers to get its resource details.
@@ -110,17 +222,26 @@ def get_server_details(
         dns_alias = get_dns_aliases(credentials, subscription_id, server)
         ad_admins = get_ad_admins(credentials, subscription_id, server)
         r_databases = get_recoverable_databases(credentials, subscription_id, server)
-        rd_databases = get_restorable_dropped_databases(credentials, subscription_id, server)
+        rd_databases = get_restorable_dropped_databases(
+            credentials,
+            subscription_id,
+            server,
+        )
         fgs = get_failover_groups(credentials, subscription_id, server)
         elastic_pools = get_elastic_pools(credentials, subscription_id, server)
         databases = get_databases(credentials, subscription_id, server)
-        yield server['id'], server['name'], server[
-            'resourceGroup'
-        ], dns_alias, ad_admins, r_databases, rd_databases, fgs, elastic_pools, databases
+        firewall_rules = get_firewall_rules(credentials, subscription_id, server)
+        yield server["id"], server["name"], server[
+            "resourceGroup"
+        ], dns_alias, ad_admins, r_databases, rd_databases, fgs, elastic_pools, databases, firewall_rules
 
 
 @timeit
-def get_dns_aliases(credentials: Credentials, subscription_id: str, server: Dict) -> List[Dict]:
+def get_dns_aliases(
+    credentials: Credentials,
+    subscription_id: str,
+    server: Dict,
+) -> List[Dict]:
     """
     Returns details of the DNS aliases in a server.
     """
@@ -128,13 +249,18 @@ def get_dns_aliases(credentials: Credentials, subscription_id: str, server: Dict
         client = get_client(credentials, subscription_id)
         dns_aliases = list(
             map(
-                lambda x: x.as_dict(),
-                client.server_dns_aliases.list_by_server(server['resourceGroup'], server['name']),
+                lambda x: transform_sql_detail(x.as_dict()),
+                client.server_dns_aliases.list_by_server(
+                    server["resourceGroup"],
+                    server["name"],
+                ),
             ),
         )
 
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving DNS Aliases - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving DNS Aliases - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"DNS Alias resource not found error - {e}")
@@ -147,7 +273,11 @@ def get_dns_aliases(credentials: Credentials, subscription_id: str, server: Dict
 
 
 @timeit
-def get_ad_admins(credentials: Credentials, subscription_id: str, server: Dict) -> List[Dict]:
+def get_ad_admins(
+    credentials: Credentials,
+    subscription_id: str,
+    server: Dict,
+) -> List[Dict]:
     """
     Returns details of the Server AD Administrators in a server.
     """
@@ -155,16 +285,18 @@ def get_ad_admins(credentials: Credentials, subscription_id: str, server: Dict) 
         client = get_client(credentials, subscription_id)
         ad_admins = list(
             map(
-                lambda x: x.as_dict(),
+                lambda x: transform_sql_detail(x.as_dict()),
                 client.server_azure_ad_administrators.list_by_server(
-                    server['resourceGroup'],
-                    server['name'],
+                    server["resourceGroup"],
+                    server["name"],
                 ),
             ),
         )
 
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving Azure AD Administrators - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving Azure AD Administrators - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Azure AD Administrators resource not found error - {e}")
@@ -177,7 +309,11 @@ def get_ad_admins(credentials: Credentials, subscription_id: str, server: Dict) 
 
 
 @timeit
-def get_recoverable_databases(credentials: Credentials, subscription_id: str, server: Dict) -> List[Dict]:
+def get_recoverable_databases(
+    credentials: Credentials,
+    subscription_id: str,
+    server: Dict,
+) -> List[Dict]:
     """
     Returns details of the Recoverable databases in a server.
     """
@@ -185,10 +321,10 @@ def get_recoverable_databases(credentials: Credentials, subscription_id: str, se
         client = get_client(credentials, subscription_id)
         recoverable_databases = list(
             map(
-                lambda x: x.as_dict(),
+                lambda x: transform_sql_detail(x.as_dict()),
                 client.recoverable_databases.list_by_server(
-                    server['resourceGroup'],
-                    server['name'],
+                    server["resourceGroup"],
+                    server["name"],
                 ),
             ),
         )
@@ -197,7 +333,9 @@ def get_recoverable_databases(credentials: Credentials, subscription_id: str, se
         # The API returns a '404 CloudError: Not Found for url: <url>' if no recoverable databases are present.
         return []
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving recoverable databases - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving recoverable databases - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Recoverable databases resource not found error - {e}")
@@ -210,7 +348,11 @@ def get_recoverable_databases(credentials: Credentials, subscription_id: str, se
 
 
 @timeit
-def get_restorable_dropped_databases(credentials: Credentials, subscription_id: str, server: Dict) -> List[Dict]:
+def get_restorable_dropped_databases(
+    credentials: Credentials,
+    subscription_id: str,
+    server: Dict,
+) -> List[Dict]:
     """
     Returns details of the Restorable Dropped Databases in a server.
     """
@@ -218,15 +360,18 @@ def get_restorable_dropped_databases(credentials: Credentials, subscription_id: 
         client = get_client(credentials, subscription_id)
         restorable_dropped_databases = list(
             map(
-                lambda x: x.as_dict(),
+                lambda x: transform_sql_detail(x.as_dict()),
                 client.restorable_dropped_databases.list_by_server(
-                    server['resourceGroup'], server['name'],
+                    server["resourceGroup"],
+                    server["name"],
                 ),
             ),
         )
 
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving Restorable Dropped Databases - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving Restorable Dropped Databases - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Restorable Dropped Databases resource not found error - {e}")
@@ -239,18 +384,30 @@ def get_restorable_dropped_databases(credentials: Credentials, subscription_id: 
 
 
 @timeit
-def get_failover_groups(credentials: Credentials, subscription_id: str, server: Dict) -> List[Dict]:
+def get_failover_groups(
+    credentials: Credentials,
+    subscription_id: str,
+    server: Dict,
+) -> List[Dict]:
     """
     Returns details of Failover groups in a server.
     """
     try:
         client = get_client(credentials, subscription_id)
         failover_groups = list(
-            map(lambda x: x.as_dict(), client.failover_groups.list_by_server(server['resourceGroup'], server['name'])),
+            map(
+                lambda x: transform_sql_detail(x.as_dict()),
+                client.failover_groups.list_by_server(
+                    server["resourceGroup"],
+                    server["name"],
+                ),
+            ),
         )
 
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving Failover groups - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving Failover groups - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Failover groups resource not found error - {e}")
@@ -263,18 +420,30 @@ def get_failover_groups(credentials: Credentials, subscription_id: str, server: 
 
 
 @timeit
-def get_elastic_pools(credentials: Credentials, subscription_id: str, server: Dict) -> List[Dict]:
+def get_elastic_pools(
+    credentials: Credentials,
+    subscription_id: str,
+    server: Dict,
+) -> List[Dict]:
     """
     Returns details of Elastic Pools in a server.
     """
     try:
         client = get_client(credentials, subscription_id)
         elastic_pools = list(
-            map(lambda x: x.as_dict(), client.elastic_pools.list_by_server(server['resourceGroup'], server['name'])),
+            map(
+                lambda x: transform_sql_detail(x.as_dict()),
+                client.elastic_pools.list_by_server(
+                    server["resourceGroup"],
+                    server["name"],
+                ),
+            ),
         )
 
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving Elastic Pools - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving Elastic Pools - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Elastic Pools resource not found error - {e}")
@@ -287,18 +456,66 @@ def get_elastic_pools(credentials: Credentials, subscription_id: str, server: Di
 
 
 @timeit
-def get_databases(credentials: Credentials, subscription_id: str, server: Dict) -> List[Dict]:
+def get_firewall_rules(
+    credentials: Credentials,
+    subscription_id: str,
+    server: Dict,
+) -> List[Dict]:
+    """
+    Returns details of the firewall rules in a SQL server.
+    """
+    try:
+        client = get_client(credentials, subscription_id)
+        firewall_rules = list(
+            map(
+                lambda x: transform_sql_firewall_rule(x.as_dict()),
+                client.firewall_rules.list_by_server(
+                    server["resourceGroup"],
+                    server["name"],
+                ),
+            ),
+        )
+
+    except ClientAuthenticationError as e:
+        logger.warning(
+            f"Client Authentication Error while retrieving firewall rules - {e}",
+        )
+        return []
+    except ResourceNotFoundError as e:
+        logger.warning(f"Firewall rules resource not found error - {e}")
+        return []
+    except HttpResponseError as e:
+        logger.warning(f"Error while retrieving firewall rules - {e}")
+        return []
+
+    return firewall_rules
+
+
+@timeit
+def get_databases(
+    credentials: Credentials,
+    subscription_id: str,
+    server: Dict,
+) -> List[Dict]:
     """
     Returns details of Databases in a SQL server.
     """
     try:
         client = get_client(credentials, subscription_id)
         databases = list(
-            map(lambda x: x.as_dict(), client.databases.list_by_server(server['resourceGroup'], server['name'])),
+            map(
+                lambda x: transform_sql_database(x.as_dict()),
+                client.databases.list_by_server(
+                    server["resourceGroup"],
+                    server["name"],
+                ),
+            ),
         )
 
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving SQL databases - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving SQL databases - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"SQL databases resource not found error - {e}")
@@ -312,12 +529,12 @@ def get_databases(credentials: Credentials, subscription_id: str, server: Dict) 
 
 @timeit
 def load_server_details(
-        neo4j_session: neo4j.Session, credentials: Credentials, subscription_id: str,
-        details: List[Tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]], update_tag: int,
+    neo4j_session: neo4j.Session,
+    credentials: Credentials,
+    subscription_id: str,
+    details: Iterable[Tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]],
+    update_tag: int,
 ) -> None:
-    """
-    Create dictionaries for every resource in the server so we can import them in a single query
-    """
     dns_aliases = []
     ad_admins = []
     recoverable_databases = []
@@ -325,312 +542,322 @@ def load_server_details(
     failover_groups = []
     elastic_pools = []
     databases = []
+    firewall_rules: List[Dict] = []
 
-    for server_id, name, rg, dns_alias, ad_admin, r_database, rd_database, fg, elastic_pool, database in details:
+    for (
+        server_id,
+        name,
+        rg,
+        dns_alias,
+        ad_admin,
+        r_database,
+        rd_database,
+        fg,
+        elastic_pool,
+        database,
+        firewall_rule,
+    ) in details:
         if len(dns_alias) > 0:
             for alias in dns_alias:
-                alias['server_name'] = name
-                alias['server_id'] = server_id
+                alias["server_name"] = name
+                alias["server_id"] = server_id
                 dns_aliases.append(alias)
 
         if len(ad_admin) > 0:
             for admin in ad_admin:
-                admin['server_name'] = name
-                admin['server_id'] = server_id
+                admin["server_name"] = name
+                admin["server_id"] = server_id
                 ad_admins.append(admin)
 
         if len(r_database) > 0:
             for rdb in r_database:
-                rdb['server_name'] = name
-                rdb['server_id'] = server_id
+                rdb["server_name"] = name
+                rdb["server_id"] = server_id
                 recoverable_databases.append(rdb)
 
         if len(rd_database) > 0:
             for rddb in rd_database:
-                rddb['server_name'] = name
-                rddb['server_id'] = server_id
+                rddb["server_name"] = name
+                rddb["server_id"] = server_id
                 restorable_dropped_databases.append(rddb)
 
         if len(fg) > 0:
             for group in fg:
-                group['server_name'] = name
-                group['server_id'] = server_id
+                group["server_name"] = name
+                group["server_id"] = server_id
                 failover_groups.append(group)
 
         if len(elastic_pool) > 0:
             for pool in elastic_pool:
-                pool['server_name'] = name
-                pool['server_id'] = server_id
+                pool["server_name"] = name
+                pool["server_id"] = server_id
                 elastic_pools.append(pool)
 
         if len(database) > 0:
             for db in database:
-                db['server_name'] = name
-                db['server_id'] = server_id
-                db['resource_group_name'] = rg
+                db["server_name"] = name
+                db["server_id"] = server_id
+                db["resource_group_name"] = rg
                 databases.append(db)
 
-    _load_server_dns_aliases(neo4j_session, dns_aliases, update_tag)
-    _load_server_ad_admins(neo4j_session, ad_admins, update_tag)
-    _load_recoverable_databases(neo4j_session, recoverable_databases, update_tag)
-    _load_restorable_dropped_databases(neo4j_session, restorable_dropped_databases, update_tag)
-    _load_failover_groups(neo4j_session, failover_groups, update_tag)
-    _load_elastic_pools(neo4j_session, elastic_pools, update_tag)
-    _load_databases(neo4j_session, databases, update_tag)
+        if len(firewall_rule) > 0:
+            for fr in firewall_rule:
+                fr_props = fr.get("properties", {})
+                fr["start_ip_address"] = fr.get("start_ip_address") or fr_props.get(
+                    "start_ip_address"
+                )
+                fr["end_ip_address"] = fr.get("end_ip_address") or fr_props.get(
+                    "end_ip_address"
+                )
+                fr["server_id"] = server_id
+                firewall_rules.append(fr)
 
-    sync_database_details(neo4j_session, credentials, subscription_id, databases, update_tag)
+    _load_elastic_pools(neo4j_session, elastic_pools, subscription_id, update_tag)
+    _load_failover_groups(neo4j_session, failover_groups, subscription_id, update_tag)
+    _load_databases(neo4j_session, databases, subscription_id, update_tag)
+    _load_recoverable_databases(
+        neo4j_session, recoverable_databases, subscription_id, update_tag
+    )
+    _load_restorable_dropped_databases(
+        neo4j_session,
+        restorable_dropped_databases,
+        subscription_id,
+        update_tag,
+    )
+    _load_server_dns_aliases(neo4j_session, dns_aliases, subscription_id, update_tag)
+    _load_server_ad_admins(neo4j_session, ad_admins, subscription_id, update_tag)
+    _load_firewall_rules(neo4j_session, firewall_rules, subscription_id, update_tag)
+
+    sync_database_details(
+        neo4j_session,
+        credentials,
+        subscription_id,
+        databases,
+        update_tag,
+    )
 
 
 @timeit
 def _load_server_dns_aliases(
-        neo4j_session: neo4j.Session, dns_aliases: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    dns_aliases: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest the DNS Alias details into neo4j.
     """
-    ingest_dns_aliases = """
-    UNWIND {dns_aliases_list} as dns_alias
-    MERGE (alias:AzureServerDNSAlias{id: dns_alias.id})
-    ON CREATE SET alias.firstseen = timestamp()
-    SET alias.name = dns_alias.name,
-    alias.dnsrecord = dns_alias.azure_dns_record,
-    alias.lastupdated = {azure_update_tag}
-    WITH alias, dns_alias
-    MATCH (s:AzureSQLServer{id: dns_alias.server_id})
-    MERGE (s)-[r:USED_BY]->(alias)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_dns_aliases,
-        dns_aliases_list=dns_aliases,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureServerDNSAliasSchema(),
+        dns_aliases,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_server_ad_admins(
-        neo4j_session: neo4j.Session, ad_admins: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    ad_admins: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest the Server AD Administrators details into neo4j.
     """
-    ingest_ad_admins = """
-    UNWIND {ad_admins_list} as ad_admin
-    MERGE (a:AzureServerADAdministrator{id: ad_admin.id})
-    ON CREATE SET a.firstseen = timestamp()
-    SET a.name = ad_admin.name,
-    a.administratortype = ad_admin.administrator_type,
-    a.login = ad_admin.login,
-    a.lastupdated = {azure_update_tag}
-    WITH a, ad_admin
-    MATCH (s:AzureSQLServer{id: ad_admin.server_id})
-    MERGE (s)-[r:ADMINISTERED_BY]->(a)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_ad_admins,
-        ad_admins_list=ad_admins,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureServerADAdministratorSchema(),
+        ad_admins,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_recoverable_databases(
-        neo4j_session: neo4j.Session, recoverable_databases: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    recoverable_databases: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest the recoverable database details into neo4j.
     """
-    ingest_recoverable_databases = """
-    UNWIND {recoverable_databases_list} as rec_db
-    MERGE (rd:AzureRecoverableDatabase{id: rec_db.id})
-    ON CREATE SET rd.firstseen = timestamp()
-    SET rd.name = rec_db.name,
-    rd.edition = rec_db.edition,
-    rd.servicelevelobjective = rec_db.service_level_objective,
-    rd.lastbackupdate = rec_db.last_available_backup_date,
-    rd.lastupdated = {azure_update_tag}
-    WITH rd, rec_db
-    MATCH (s:AzureSQLServer{id: rec_db.server_id})
-    MERGE (s)-[r:RESOURCE]->(rd)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_recoverable_databases,
-        recoverable_databases_list=recoverable_databases,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureRecoverableDatabaseSchema(),
+        recoverable_databases,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_restorable_dropped_databases(
-        neo4j_session: neo4j.Session, restorable_dropped_databases: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    restorable_dropped_databases: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest the restorable dropped database details into neo4j.
     """
-    ingest_restorable_dropped_databases = """
-    UNWIND {restorable_dropped_databases_list} as res_dropped_db
-    MERGE (rdd:AzureRestorableDroppedDatabase{id: res_dropped_db.id})
-    ON CREATE SET rdd.firstseen = timestamp(), rdd.location = res_dropped_db.location
-    SET rdd.name = res_dropped_db.name,
-    rdd.databasename = res_dropped_db.database_name,
-    rdd.creationdate = res_dropped_db.creation_date,
-    rdd.deletiondate = res_dropped_db.deletion_date,
-    rdd.restoredate = res_dropped_db.earliest_restore_date,
-    rdd.edition = res_dropped_db.edition,
-    rdd.servicelevelobjective = res_dropped_db.service_level_objective,
-    rdd.maxsizebytes = res_dropped_db.max_size_bytes,
-    rdd.lastupdated = {azure_update_tag}
-    WITH rdd, res_dropped_db
-    MATCH (s:AzureSQLServer{id: res_dropped_db.server_id})
-    MERGE (s)-[r:RESOURCE]->(rdd)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_restorable_dropped_databases,
-        restorable_dropped_databases_list=restorable_dropped_databases,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureRestorableDroppedDatabaseSchema(),
+        restorable_dropped_databases,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_failover_groups(
-        neo4j_session: neo4j.Session, failover_groups: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    failover_groups: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest the failover groups details into neo4j.
     """
-    ingest_failover_groups = """
-    UNWIND {failover_groups_list} as fg
-    MERGE (f:AzureFailoverGroup{id: fg.id})
-    ON CREATE SET f.firstseen = timestamp(), f.location = fg.location
-    SET f.name = fg.name,
-    f.replicationrole = fg.replication_role,
-    f.replicationstate = fg.replication_state,
-    f.lastupdated = {azure_update_tag}
-    WITH f, fg
-    MATCH (s:AzureSQLServer{id: fg.server_id})
-    MERGE (s)-[r:RESOURCE]->(f)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_failover_groups,
-        failover_groups_list=failover_groups,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureFailoverGroupSchema(),
+        failover_groups,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_elastic_pools(
-        neo4j_session: neo4j.Session, elastic_pools: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    elastic_pools: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest the elastic pool details into neo4j.
     """
-    ingest_elastic_pools = """
-    UNWIND {elastic_pools_list} as ep
-    MERGE (e:AzureElasticPool{id: ep.id})
-    ON CREATE SET e.firstseen = timestamp(), e.location = ep.location
-    SET e.name = ep.name,
-    e.kind = ep.kind,
-    e.creationdate = ep.creation_date,
-    e.state = ep.state,
-    e.maxsizebytes = ep.max_size_bytes,
-    e.licensetype = ep.license_type,
-    e.zoneredundant = ep.zone_redundant,
-    e.lastupdated = {azure_update_tag}
-    WITH e, ep
-    MATCH (s:AzureSQLServer{id: ep.server_id})
-    MERGE (s)-[r:RESOURCE]->(e)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_elastic_pools,
-        elastic_pools_list=elastic_pools,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureElasticPoolSchema(),
+        elastic_pools,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_databases(
-        neo4j_session: neo4j.Session, databases: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    databases: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest the database details into neo4j.
     """
-    ingest_databases = """
-    UNWIND {databases_list} as az_database
-    MERGE (d:AzureSQLDatabase{id: az_database.id})
-    ON CREATE SET d.firstseen = timestamp(), d.location = az_database.location
-    SET d.name = az_database.name,
-    d.kind = az_database.kind,
-    d.creationdate = az_database.creation_date,
-    d.databaseid = az_database.database_id,
-    d.maxsizebytes = az_database.max_size_bytes,
-    d.licensetype = az_database.license_type,
-    d.secondarylocation = az_database.default_secondary_location,
-    d.elasticpoolid = az_database.elastic_pool_id,
-    d.collation = az_database.collation,
-    d.failovergroupid = az_database.failover_group_id,
-    d.zoneredundant = az_database.zone_redundant,
-    d.restorabledroppeddbid = az_database.restorable_dropped_database_id,
-    d.recoverabledbid = az_database.recoverable_database_id,
-    d.lastupdated = {azure_update_tag}
-    WITH d, az_database
-    MATCH (s:AzureSQLServer{id: az_database.server_id})
-    MERGE (s)-[r:RESOURCE]->(d)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
+    load(
+        neo4j_session,
+        AzureSQLDatabaseSchema(),
+        databases,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
+    )
 
-    neo4j_session.run(
-        ingest_databases,
-        databases_list=databases,
-        azure_update_tag=update_tag,
+
+@timeit
+def _load_firewall_rules(
+    neo4j_session: neo4j.Session,
+    firewall_rules: List[Dict],
+    subscription_id: str,
+    update_tag: int,
+) -> None:
+    """
+    Ingest SQL Server firewall rule details into neo4j.
+    """
+    load(
+        neo4j_session,
+        AzureSQLServerFirewallRuleSchema(),
+        firewall_rules,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
+    )
+
+
+@timeit
+def load_sql_server_tags(
+    neo4j_session: neo4j.Session,
+    subscription_id: str,
+    servers: List[Dict],
+    update_tag: int,
+) -> None:
+    """
+    Loads tags for SQL Servers.
+    """
+    tags = transform_tags(servers, subscription_id)
+    load(
+        neo4j_session,
+        AzureSQLServerTagsSchema(),
+        tags,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def sync_database_details(
-        neo4j_session: neo4j.Session, credentials: Credentials,
-        subscription_id: str, databases: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    credentials: Credentials,
+    subscription_id: str,
+    databases: List[Dict],
+    update_tag: int,
 ) -> None:
     db_details = get_database_details(credentials, subscription_id, databases)
-    load_database_details(neo4j_session, db_details, update_tag)
+    load_database_details(neo4j_session, db_details, subscription_id, update_tag)  # type: ignore
 
 
 @timeit
 def get_database_details(
-        credentials: Credentials, subscription_id: str, databases: List[Dict],
+    credentials: Credentials,
+    subscription_id: str,
+    databases: List[Dict],
 ) -> Generator[Any, Any, Any]:
     """
     Iterate over the databases to get the details of resources in it.
     """
     for database in databases:
-        replication_links = get_replication_links(credentials, subscription_id, database)
-        db_threat_detection_policies = get_db_threat_detection_policies(credentials, subscription_id, database)
+        replication_links = get_replication_links(
+            credentials,
+            subscription_id,
+            database,
+        )
+        db_threat_detection_policies = get_db_threat_detection_policies(
+            credentials,
+            subscription_id,
+            database,
+        )
         restore_points = get_restore_points(credentials, subscription_id, database)
-        transparent_data_encryptions = get_transparent_data_encryptions(credentials, subscription_id, database)
+        transparent_data_encryptions = get_transparent_data_encryptions(
+            credentials,
+            subscription_id,
+            database,
+        )
         yield database[
-            'id'
+            "id"
         ], replication_links, db_threat_detection_policies, restore_points, transparent_data_encryptions
 
 
 @timeit
-def get_replication_links(credentials: Credentials, subscription_id: str, database: Dict) -> List[Dict]:
+def get_replication_links(
+    credentials: Credentials,
+    subscription_id: str,
+    database: Dict,
+) -> List[Dict]:
     """
     Returns the details of replication links in a database.
     """
@@ -638,17 +865,19 @@ def get_replication_links(credentials: Credentials, subscription_id: str, databa
         client = get_client(credentials, subscription_id)
         replication_links = list(
             map(
-                lambda x: x.as_dict(),
+                lambda x: transform_sql_detail(x.as_dict()),
                 client.replication_links.list_by_database(
-                    database['resource_group_name'],
-                    database['server_name'],
-                    database['name'],
+                    database["resource_group_name"],
+                    database["server_name"],
+                    database["name"],
                 ),
             ),
         )
 
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving replication links - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving replication links - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Replication links resource not found error - {e}")
@@ -661,33 +890,48 @@ def get_replication_links(credentials: Credentials, subscription_id: str, databa
 
 
 @timeit
-def get_db_threat_detection_policies(credentials: Credentials, subscription_id: str, database: Dict) -> List[Dict]:
+def get_db_threat_detection_policies(
+    credentials: Credentials,
+    subscription_id: str,
+    database: Dict,
+) -> List[Dict]:
     """
     Returns the threat detection policy of a database.
     """
     try:
         client = get_client(credentials, subscription_id)
-        db_threat_detection_policies = client.database_threat_detection_policies.get(
-            database['resource_group_name'],
-            database['server_name'],
-            database['name'],
+        db_threat_detection_policies = client.database_security_alert_policies.get(
+            database["resource_group_name"],
+            database["server_name"],
+            database["name"],
             SecurityAlertPolicyName.DEFAULT,
         ).as_dict()
+        db_threat_detection_policies = transform_sql_detail(
+            db_threat_detection_policies
+        )
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving threat detection policy - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving threat detection policy - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Threat detection policy resource not found error - {e}")
         return []
     except HttpResponseError as e:
-        logger.warning(f"Error while retrieving database threat detection policies - {e}")
+        logger.warning(
+            f"Error while retrieving database threat detection policies - {e}",
+        )
         return []
 
     return db_threat_detection_policies
 
 
 @timeit
-def get_restore_points(credentials: Credentials, subscription_id: str, database: Dict) -> List[Dict]:
+def get_restore_points(
+    credentials: Credentials,
+    subscription_id: str,
+    database: Dict,
+) -> List[Dict]:
     """
     Returns the details of restore points in a database.
     """
@@ -695,17 +939,19 @@ def get_restore_points(credentials: Credentials, subscription_id: str, database:
         client = get_client(credentials, subscription_id)
         restore_points_list = list(
             map(
-                lambda x: x.as_dict(),
+                lambda x: transform_sql_detail(x.as_dict()),
                 client.restore_points.list_by_database(
-                    database['resource_group_name'],
-                    database['server_name'],
-                    database['name'],
+                    database["resource_group_name"],
+                    database["server_name"],
+                    database["name"],
                 ),
             ),
         )
 
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving restore points - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving restore points - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Restore points resource not found error - {e}")
@@ -718,20 +964,29 @@ def get_restore_points(credentials: Credentials, subscription_id: str, database:
 
 
 @timeit
-def get_transparent_data_encryptions(credentials: Credentials, subscription_id: str, database: Dict) -> List[Dict]:
+def get_transparent_data_encryptions(
+    credentials: Credentials,
+    subscription_id: str,
+    database: Dict,
+) -> List[Dict]:
     """
     Returns the details of transparent data encryptions in a database.
     """
     try:
         client = get_client(credentials, subscription_id)
         transparent_data_encryptions_list = client.transparent_data_encryptions.get(
-            database['resource_group_name'],
-            database['server_name'],
-            database['name'],
+            database["resource_group_name"],
+            database["server_name"],
+            database["name"],
             TransparentDataEncryptionName.CURRENT,
         ).as_dict()
+        transparent_data_encryptions_list = transform_sql_detail(
+            transparent_data_encryptions_list
+        )
     except ClientAuthenticationError as e:
-        logger.warning(f"Client Authentication Error while retrieving transparent data encryptions - {e}")
+        logger.warning(
+            f"Client Authentication Error while retrieving transparent data encryptions - {e}",
+        )
         return []
     except ResourceNotFoundError as e:
         logger.warning(f"Transparent data encryptions resource not found error - {e}")
@@ -745,7 +1000,10 @@ def get_transparent_data_encryptions(credentials: Credentials, subscription_id: 
 
 @timeit
 def load_database_details(
-        neo4j_session: neo4j.Session, details: List[Tuple[Any, Any, Any, Any, Any]], update_tag: int,
+    neo4j_session: neo4j.Session,
+    details: List[Tuple[Any, Any, Any, Any, Any]],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Create dictionaries for every resource in a database so we can import them in a single query
@@ -755,180 +1013,177 @@ def load_database_details(
     restore_points = []
     encryptions_list = []
 
-    for databaseId, replication_link, db_threat_detection_policy, restore_point, transparent_data_encryption in details:
+    for (
+        databaseId,
+        replication_link,
+        db_threat_detection_policy,
+        restore_point,
+        transparent_data_encryption,
+    ) in details:
         if len(replication_link) > 0:
             for link in replication_link:
-                link['database_id'] = databaseId
+                link["database_id"] = databaseId
                 replication_links.append(link)
 
         if len(db_threat_detection_policy) > 0:
-            db_threat_detection_policy['database_id'] = databaseId
+            db_threat_detection_policy["database_id"] = databaseId
             threat_detection_policies.append(db_threat_detection_policy)
 
         if len(restore_point) > 0:
             for point in restore_point:
-                point['database_id'] = databaseId
+                point["database_id"] = databaseId
                 restore_points.append(point)
 
         if len(transparent_data_encryption) > 0:
-            transparent_data_encryption['database_id'] = databaseId
+            transparent_data_encryption["database_id"] = databaseId
             encryptions_list.append(transparent_data_encryption)
 
-    _load_replication_links(neo4j_session, replication_links, update_tag)
-    _load_db_threat_detection_policies(neo4j_session, threat_detection_policies, update_tag)
-    _load_restore_points(neo4j_session, restore_points, update_tag)
-    _load_transparent_data_encryptions(neo4j_session, encryptions_list, update_tag)
+    _load_replication_links(
+        neo4j_session, replication_links, subscription_id, update_tag
+    )
+    _load_db_threat_detection_policies(
+        neo4j_session,
+        threat_detection_policies,
+        subscription_id,
+        update_tag,
+    )
+    _load_restore_points(neo4j_session, restore_points, subscription_id, update_tag)
+    _load_transparent_data_encryptions(
+        neo4j_session, encryptions_list, subscription_id, update_tag
+    )
 
 
 @timeit
 def _load_replication_links(
-        neo4j_session: neo4j.Session, replication_links: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    replication_links: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest replication links into neo4j.
     """
-    ingest_replication_links = """
-    UNWIND {replication_links_list} as replication_link
-    MERGE (rl:AzureReplicationLink{id: replication_link.id})
-    ON CREATE SET rl.firstseen = timestamp(),
-    rl.location = replication_link.location
-    SET rl.name = replication_link.name,
-    rl.partnerdatabase = replication_link.partner_database,
-    rl.partnerlocation = replication_link.partner_location,
-    rl.partnerrole = replication_link.partner_role,
-    rl.partnerserver = replication_link.partner_server,
-    rl.mode = replication_link.replication_mode,
-    rl.state = replication_link.replication_state,
-    rl.percentcomplete = replication_link.percent_complete,
-    rl.role = replication_link.role,
-    rl.starttime = replication_link.start_time,
-    rl.terminationallowed = replication_link.is_termination_allowed,
-    rl.lastupdated = {azure_update_tag}
-    WITH rl, replication_link
-    MATCH (d:AzureSQLDatabase{id: replication_link.database_id})
-    MERGE (d)-[r:CONTAINS]->(rl)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_replication_links,
-        replication_links_list=replication_links,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureReplicationLinkSchema(),
+        replication_links,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_db_threat_detection_policies(
-        neo4j_session: neo4j.Session, threat_detection_policies: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    threat_detection_policies: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest threat detection policy into neo4j.
     """
-    ingest_threat_detection_policies = """
-    UNWIND {threat_detection_policies_list} as tdp
-    MERGE (policy:AzureDatabaseThreatDetectionPolicy{id: tdp.id})
-    ON CREATE SET policy.firstseen = timestamp(),
-    policy.location = tdp.location
-    SET policy.name = tdp.name,
-    policy.location = tdp.location,
-    policy.kind = tdp.kind,
-    policy.emailadmins = tdp.email_account_admins,
-    policy.emailaddresses = tdp.email_addresses,
-    policy.retentiondays = tdp.retention_days,
-    policy.state = tdp.state,
-    policy.storageendpoint = tdp.storage_endpoint,
-    policy.useserverdefault = tdp.use_server_default,
-    policy.disabledalerts = tdp.disabled_alerts,
-    policy.lastupdated = {azure_update_tag}
-    WITH policy, tdp
-    MATCH (d:AzureSQLDatabase{id: tdp.database_id})
-    MERGE (d)-[r:CONTAINS]->(policy)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_threat_detection_policies,
-        threat_detection_policies_list=threat_detection_policies,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureDatabaseThreatDetectionPolicySchema(),
+        threat_detection_policies,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_restore_points(
-        neo4j_session: neo4j.Session, restore_points: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    restore_points: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest restore points into neo4j.
     """
-    ingest_restore_points = """
-    UNWIND {restore_points_list} as rp
-    MERGE (point:AzureRestorePoint{id: rp.id})
-    ON CREATE SET point.firstseen = timestamp(),
-    point.location = rp.location
-    SET point.name = rp.name,
-    point.restoredate = rp.earliest_restore_date,
-    point.restorepointtype = rp.restore_point_type,
-    point.creationdate = rp.restore_point_creation_date,
-    point.lastupdated = {azure_update_tag}
-    WITH point, rp
-    MATCH (d:AzureSQLDatabase{id: rp.database_id})
-    MERGE (d)-[r:CONTAINS]->(point)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_restore_points,
-        restore_points_list=restore_points,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureRestorePointSchema(),
+        restore_points,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def _load_transparent_data_encryptions(
-        neo4j_session: neo4j.Session, encryptions_list: List[Dict], update_tag: int,
+    neo4j_session: neo4j.Session,
+    encryptions_list: List[Dict],
+    subscription_id: str,
+    update_tag: int,
 ) -> None:
     """
     Ingest transparent data encryptions into neo4j.
     """
-    ingest_data_encryptions = """
-    UNWIND {transparent_data_encryptions_list} as e
-    MERGE (tae:AzureTransparentDataEncryption{id: e.id})
-    ON CREATE SET tae.firstseen = timestamp(),
-    tae.location = e.location
-    SET tae.name = e.name,
-    tae.status = e.status,
-    tae.lastupdated = {azure_update_tag}
-    WITH tae, e
-    MATCH (d:AzureSQLDatabase{id: e.database_id})
-    MERGE (d)-[r:CONTAINS]->(tae)
-    ON CREATE SET r.firstseen = timestamp()
-    SET r.lastupdated = {azure_update_tag}
-    """
-
-    neo4j_session.run(
-        ingest_data_encryptions,
-        transparent_data_encryptions_list=encryptions_list,
-        azure_update_tag=update_tag,
+    load(
+        neo4j_session,
+        AzureTransparentDataEncryptionSchema(),
+        encryptions_list,
+        lastupdated=update_tag,
+        AZURE_SUBSCRIPTION_ID=subscription_id,
     )
 
 
 @timeit
 def cleanup_azure_sql_servers(
-        neo4j_session: neo4j.Session, common_job_parameters: Dict,
+    neo4j_session: neo4j.Session,
+    common_job_parameters: Dict,
 ) -> None:
-    run_cleanup_job('azure_sql_server_cleanup.json', neo4j_session, common_job_parameters)
+    for node in [
+        AzureSQLServerSchema,
+        AzureServerDNSAliasSchema,
+        AzureServerADAdministratorSchema,
+        AzureReplicationLinkSchema,
+        AzureRestorePointSchema,
+        AzureTransparentDataEncryptionSchema,
+        AzureDatabaseThreatDetectionPolicySchema,
+        AzureSQLDatabaseSchema,
+        AzureSQLServerFirewallRuleSchema,
+        AzureElasticPoolSchema,
+        AzureFailoverGroupSchema,
+        AzureRecoverableDatabaseSchema,
+        AzureRestorableDroppedDatabaseSchema,
+    ]:
+        GraphJob.from_node_schema(node(), common_job_parameters).run(
+            neo4j_session,
+        )
+
+
+@timeit
+def cleanup_sql_server_tags(
+    neo4j_session: neo4j.Session, common_job_parameters: Dict
+) -> None:
+    """
+    Runs cleanup job for Azure SQL Server tags.
+    """
+    GraphJob.from_node_schema(AzureSQLServerTagsSchema(), common_job_parameters).run(
+        neo4j_session
+    )
 
 
 @timeit
 def sync(
-        neo4j_session: neo4j.Session, credentials: Credentials, subscription_id: str,
-        sync_tag: int, common_job_parameters: Dict,
+    neo4j_session: neo4j.Session,
+    credentials: Credentials,
+    subscription_id: str,
+    sync_tag: int,
+    common_job_parameters: Dict,
 ) -> None:
     logger.info("Syncing Azure SQL for subscription '%s'.", subscription_id)
     server_list = get_server_list(credentials, subscription_id)
     load_server_data(neo4j_session, subscription_id, server_list, sync_tag)
-    sync_server_details(neo4j_session, credentials, subscription_id, server_list, sync_tag)
+    load_sql_server_tags(neo4j_session, subscription_id, server_list, sync_tag)
+    sync_server_details(
+        neo4j_session,
+        credentials,
+        subscription_id,
+        server_list,
+        sync_tag,
+    )
     cleanup_azure_sql_servers(neo4j_session, common_job_parameters)
+    cleanup_sql_server_tags(neo4j_session, common_job_parameters)

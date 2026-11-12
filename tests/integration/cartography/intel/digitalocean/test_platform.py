@@ -1,44 +1,37 @@
+from unittest.mock import MagicMock
+
 import cartography.intel.digitalocean.platform
 import tests.data.digitalocean.platform
+from tests.integration.util import check_nodes
 
 TEST_UPDATE_TAG = 123456789
 
 
 def test_transform_and_load_account(neo4j_session):
-    account_res = tests.data.digitalocean.platform.ACCOUNT_RESPONSE
 
-    """
-    Test that we can correctly transform and load DOAccount nodes to Neo4j.
-    """
-    account = cartography.intel.digitalocean.platform.transform_account(account_res)
-    cartography.intel.digitalocean.platform.load_account(neo4j_session, account, TEST_UPDATE_TAG)
-
-    query = """
-        MATCH(a:DOAccount{id:{AccountId}})
-        RETURN a.id, a.uuid, a.droplet_limit, a.floating_ip_limit, a.status, a.lastupdated
-        """
-    nodes = neo4j_session.run(
-        query,
-        AccountId=account_res.uuid,
+    mock_client = MagicMock()
+    mock_client.account.get.return_value = (
+        tests.data.digitalocean.platform.ACCOUNT_RESPONSE
     )
-    actual_nodes = {
+
+    cartography.intel.digitalocean.platform.sync(
+        neo4j_session,
+        mock_client,
+        TEST_UPDATE_TAG,
+        {"UPDATE_TAG": TEST_UPDATE_TAG},
+    )
+
+    account_res = tests.data.digitalocean.platform.ACCOUNT_RESPONSE.get("account", {})
+    assert check_nodes(
+        neo4j_session,
+        "DOAccount",
+        ["id", "uuid", "droplet_limit", "floating_ip_limit", "status"],
+    ) == {
         (
-            n['a.id'],
-            n['a.uuid'],
-            n['a.droplet_limit'],
-            n['a.floating_ip_limit'],
-            n['a.status'],
-            n['a.lastupdated'],
-        ) for n in nodes
-    }
-    expected_nodes = {
-        (
-            account_res.uuid,
-            account_res.uuid,
-            account_res.droplet_limit,
-            account_res.floating_ip_limit,
-            account_res.status,
-            TEST_UPDATE_TAG,
+            account_res.get("uuid", ""),
+            account_res.get("uuid", ""),
+            account_res.get("droplet_limit", 0),
+            account_res.get("floating_ip_limit", 0),
+            account_res.get("status", ""),
         ),
     }
-    assert actual_nodes == expected_nodes

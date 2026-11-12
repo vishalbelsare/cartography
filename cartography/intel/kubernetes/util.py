@@ -1,11 +1,64 @@
+import ipaddress
+import json
+import logging
+import re
+from collections.abc import Callable
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List
-from typing import Union
+from decimal import Decimal
+from decimal import InvalidOperation
+from typing import Any
 
+from dateutil.parser import isoparse
 from kubernetes import config
 from kubernetes.client import ApiClient
+from kubernetes.client import AppsV1Api
+from kubernetes.client import BatchV1Api
 from kubernetes.client import CoreV1Api
-from kubernetes.client import NetworkingV1beta1Api
+from kubernetes.client import CustomObjectsApi
+from kubernetes.client import NetworkingV1Api
+from kubernetes.client import RbacAuthorizationV1Api
+from kubernetes.client import StorageV1Api
+from kubernetes.client import VersionApi
+from kubernetes.client.exceptions import ApiException
+from kubernetes.config.kube_config import KubeConfigMerger
+
+from cartography.intel.gcp.gke_utils import GKEClusterRef
+from cartography.intel.gcp.gke_utils import parse_cluster_ref
+
+logger = logging.getLogger(__name__)
+
+
+def format_resource_quantities(resources: dict[str, Any] | None) -> str:
+    return json.dumps(
+        {str(key): str(value) for key, value in (resources or {}).items()},
+        sort_keys=True,
+    )
+
+
+def get_gpu_quantity(resources: dict[str, Any] | None) -> int | None:
+    quantities = []
+    for key, value in (resources or {}).items():
+        resource_name = str(key)
+        is_intel_gpu = resource_name in (
+            "gpu.intel.com/i915",
+            "gpu.intel.com/xe",
+        )
+        if not (
+            resource_name.endswith("/gpu")
+            or resource_name.startswith("nvidia.com/mig-")
+            or is_intel_gpu
+        ):
+            continue
+        try:
+            quantity = Decimal(str(value))
+            if quantity != quantity.to_integral_value():
+                raise ValueError
+            quantities.append(int(quantity))
+        except (InvalidOperation, ValueError, OverflowError):
+            logger.warning("Ignoring invalid Kubernetes GPU quantity %r", value)
+    return sum(quantities) if quantities else None
 
 
 class KubernetesContextNotFound(Exception):
@@ -13,39 +66,496 @@ class KubernetesContextNotFound(Exception):
 
 
 class K8CoreApiClient(CoreV1Api):
-    def __init__(self, name: str, api_client: ApiClient = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        api_client: ApiClient | None = None,
+    ) -> None:
         self.name = name
         if not api_client:
-            api_client = config.new_client_from_config(context=name)
+            api_client = config.new_client_from_config(
+                context=name, config_file=config_file
+            )
         super().__init__(api_client=api_client)
 
 
-class K8NetworkingApiClient(NetworkingV1beta1Api):
-    def __init__(self, name: str, api_client: ApiClient = None) -> None:
+class K8NetworkingApiClient(NetworkingV1Api):
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        api_client: ApiClient | None = None,
+    ) -> None:
         self.name = name
         if not api_client:
-            api_client = config.new_client_from_config(context=name)
+            api_client = config.new_client_from_config(
+                context=name, config_file=config_file
+            )
+        super().__init__(api_client=api_client)
+
+
+class K8CustomObjectsApiClient(CustomObjectsApi):
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        api_client: ApiClient | None = None,
+    ) -> None:
+        self.name = name
+        if not api_client:
+            api_client = config.new_client_from_config(
+                context=name, config_file=config_file
+            )
+        super().__init__(api_client=api_client)
+
+
+class K8VersionApiClient(VersionApi):
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        api_client: ApiClient | None = None,
+    ) -> None:
+        self.name = name
+        if not api_client:
+            api_client = config.new_client_from_config(
+                context=name, config_file=config_file
+            )
+        super().__init__(api_client=api_client)
+
+
+class K8RbacApiClient(RbacAuthorizationV1Api):
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        api_client: ApiClient | None = None,
+    ) -> None:
+        self.name = name
+        if not api_client:
+            api_client = config.new_client_from_config(
+                context=name, config_file=config_file
+            )
+        super().__init__(api_client=api_client)
+
+
+class K8AppsApiClient(AppsV1Api):
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        api_client: ApiClient | None = None,
+    ) -> None:
+        self.name = name
+        if not api_client:
+            api_client = config.new_client_from_config(
+                context=name, config_file=config_file
+            )
+        super().__init__(api_client=api_client)
+
+
+class K8BatchApiClient(BatchV1Api):
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        api_client: ApiClient | None = None,
+    ) -> None:
+        self.name = name
+        if not api_client:
+            api_client = config.new_client_from_config(
+                context=name, config_file=config_file
+            )
+        super().__init__(api_client=api_client)
+
+
+class K8StorageApiClient(StorageV1Api):
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        api_client: ApiClient | None = None,
+    ) -> None:
+        self.name = name
+        if not api_client:
+            api_client = config.new_client_from_config(
+                context=name, config_file=config_file
+            )
         super().__init__(api_client=api_client)
 
 
 class K8sClient:
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        config_file: str,
+        external_id: str | None = None,
+        api_client: ApiClient | None = None,
+        gke_cluster: dict[str, Any] | None = None,
+        tls_diagnostics: dict[str, Any] | None = None,
+    ) -> None:
         self.name = name
-        self.core = K8CoreApiClient(self.name)
-        self.networking = K8NetworkingApiClient(self.name)
+        self.config_file = config_file
+        self.external_id = external_id
+        # GKE API `Cluster` resource, set only when GKE metadata was fetched for this cluster.
+        self.gke_cluster = gke_cluster
+        # Pre-computed TLS posture for clients built without a kubeconfig.
+        self.tls_diagnostics = tls_diagnostics
+        self.core = K8CoreApiClient(self.name, self.config_file, api_client)
+        self.networking = K8NetworkingApiClient(self.name, self.config_file, api_client)
+        self.version = K8VersionApiClient(self.name, self.config_file, api_client)
+        self.rbac = K8RbacApiClient(self.name, self.config_file, api_client)
+        self.custom = K8CustomObjectsApiClient(self.name, self.config_file, api_client)
+        self.apps = K8AppsApiClient(self.name, self.config_file, api_client)
+        self.batch = K8BatchApiClient(self.name, self.config_file, api_client)
+        self.storage = K8StorageApiClient(self.name, self.config_file, api_client)
 
 
-def get_k8s_clients(kubeconfig: str) -> List[K8sClient]:
+def get_gke_cluster_ref(client: K8sClient) -> GKEClusterRef | None:
+    """Return the GKE cluster reference for a client with GKE metadata, otherwise None."""
+    if not client.gke_cluster:
+        return None
+    return parse_cluster_ref(client.gke_cluster["resource_name"])
+
+
+@dataclass(frozen=True)
+class GKENetworkScope:
+    """Where a GKE cluster's load balancers live: its project and VPC network path."""
+
+    project_id: str
+    network: str | None
+
+
+def get_gke_network_scope(client: K8sClient) -> GKENetworkScope | None:
+    """Return the project and `projects/.../global/networks/...` path of a GKE cluster."""
+    ref = get_gke_cluster_ref(client)
+    if ref is None or not client.gke_cluster:
+        return None
+    network = (client.gke_cluster.get("networkConfig") or {}).get("network")
+    if not network and client.gke_cluster.get("network"):
+        network = (
+            f"projects/{ref.project}/global/networks/{client.gke_cluster['network']}"
+        )
+    if network:
+        network = re.sub(r"^https://[a-z.]+googleapis\.com/compute/v1/", "", network)
+    return GKENetworkScope(ref.project, network)
+
+
+def gcp_forwarding_rule_match_keys(
+    ips: list[str], scope: GKENetworkScope | None
+) -> dict[str, Any]:
+    """
+    Split load balancer addresses for matching GCP forwarding rules. Non-global
+    addresses can repeat across VPCs, so they also match on network; global ones are
+    unique and match on project alone.
+    """
+    public: list[str] = []
+    private: list[str] = []
+    if scope is not None:
+        for ip in ips:
+            try:
+                is_global = ipaddress.ip_address(ip).is_global
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid load balancer address %r when matching GCP "
+                    "forwarding rules.",
+                    ip,
+                )
+                continue
+            (public if is_global else private).append(ip)
+    return {
+        "gcp_project_id": scope.project_id if scope else None,
+        "gcp_network": scope.network if scope else None,
+        "gcp_public_lb_ips": public,
+        "gcp_private_lb_ips": private,
+    }
+
+
+def get_k8s_clients(kubeconfig: str) -> list[K8sClient]:
+    # returns a tuple of (all contexts, current context)
     contexts, _ = config.list_kube_config_contexts(kubeconfig)
     if not contexts:
         raise KubernetesContextNotFound("No context found in kubeconfig.")
-    clients = list()
+
+    clients = []
     for context in contexts:
-        clients.append(K8sClient(context["name"]))
+        clients.append(
+            K8sClient(
+                context["name"],
+                kubeconfig,
+                external_id=context["context"].get("cluster"),
+            ),
+        )
     return clients
 
 
-def get_epoch(date: datetime) -> Union[int, None]:
-    if date:
-        return int(date.strftime("%s"))
+def get_qualified_resource_name(namespace: str, name: str) -> str:
+    return f"{namespace}/{name}"
+
+
+def get_controller_owner_reference(metadata: Any) -> tuple[str, str] | None:
+    """Return the ``(kind, uid)`` of the controlling ownerReference, if any.
+
+    Kubernetes marks exactly one ownerReference with ``controller=true`` (the
+    object that actually manages this resource, e.g. a ReplicaSet's Deployment,
+    a Job's CronJob, or a pod's ReplicaSet/StatefulSet/DaemonSet/Job).
+    Non-controller owners are ignored.
+    """
+    for owner in getattr(metadata, "owner_references", None) or []:
+        if getattr(owner, "controller", False):
+            return owner.kind, owner.uid
     return None
+
+
+def _get_kubeconfig_merger(kubeconfig: str) -> KubeConfigMerger:
+    return KubeConfigMerger(kubeconfig)
+
+
+def get_kubeconfig_tls_diagnostics(
+    context_name: str, kubeconfig: str
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "api_server_url": None,
+        "kubeconfig_insecure_skip_tls_verify": None,
+        "kubeconfig_has_certificate_authority_data": False,
+        "kubeconfig_has_certificate_authority_file": False,
+        "kubeconfig_ca_file_path": None,
+        "kubeconfig_has_client_certificate": False,
+        "kubeconfig_has_client_key": False,
+        "kubeconfig_tls_configuration_status": "unknown",
+    }
+
+    try:
+        merged_config = _get_kubeconfig_merger(kubeconfig).config
+    except Exception as err:
+        logger.warning(
+            "Unable to parse kubeconfig '%s' for context '%s': %s",
+            kubeconfig,
+            context_name,
+            err,
+        )
+        return diagnostics
+
+    context = merged_config["contexts"].get_with_name(context_name, safe=True)
+    if context is None:
+        return diagnostics
+
+    context_details = context.safe_get("context") or {}
+    cluster_name = context_details.get("cluster")
+    user_name = context_details.get("user")
+    if not cluster_name:
+        return diagnostics
+
+    cluster = merged_config["clusters"].get_with_name(cluster_name, safe=True)
+    if cluster is None:
+        return diagnostics
+
+    cluster_details = cluster.safe_get("cluster") or {}
+    diagnostics["api_server_url"] = cluster_details.get("server")
+
+    insecure_skip_tls_verify = cluster_details.get("insecure-skip-tls-verify")
+    diagnostics["kubeconfig_insecure_skip_tls_verify"] = insecure_skip_tls_verify
+    diagnostics["kubeconfig_has_certificate_authority_data"] = bool(
+        cluster_details.get("certificate-authority-data"),
+    )
+    ca_file_path = cluster_details.get("certificate-authority")
+    diagnostics["kubeconfig_has_certificate_authority_file"] = bool(ca_file_path)
+    diagnostics["kubeconfig_ca_file_path"] = ca_file_path
+
+    if user_name:
+        user = merged_config["users"].get_with_name(user_name, safe=True)
+        if user is not None:
+            user_details = user.safe_get("user") or {}
+            diagnostics["kubeconfig_has_client_certificate"] = bool(
+                user_details.get("client-certificate")
+                or user_details.get("client-certificate-data"),
+            )
+            diagnostics["kubeconfig_has_client_key"] = bool(
+                user_details.get("client-key") or user_details.get("client-key-data"),
+            )
+
+    if insecure_skip_tls_verify is True:
+        diagnostics["kubeconfig_tls_configuration_status"] = "insecure_skip_tls"
+    elif (
+        diagnostics["kubeconfig_has_certificate_authority_data"]
+        or diagnostics["kubeconfig_has_certificate_authority_file"]
+    ):
+        diagnostics["kubeconfig_tls_configuration_status"] = "valid_config"
+    else:
+        diagnostics["kubeconfig_tls_configuration_status"] = "missing_ca_material"
+
+    return diagnostics
+
+
+def get_epoch(date: datetime | None) -> int | None:
+    if date:
+        return int(date.timestamp())
+    return None
+
+
+def parse_rfc3339(value: str | None) -> datetime | None:
+    """
+    Parse an RFC3339 timestamp string (e.g. ``2024-01-02T03:04:05Z``) into a
+    datetime. The Kubernetes ``CustomObjectsApi`` returns metadata timestamps
+    as raw strings rather than as datetimes (unlike the typed apis), so callers
+    that need an epoch int should do ``get_epoch(parse_rfc3339(value))``.
+    """
+    if not value:
+        return None
+    return isoparse(value)
+
+
+def k8s_paginate(
+    list_func: Callable,
+    raise_on_forbidden: bool = False,
+    raise_on_error: bool = False,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """
+    Handles pagination for a Kubernetes API call.
+
+    :param list_func: The list function to call (e.g. client.core.list_pod_for_all_namespaces)
+    :param raise_on_forbidden: When True, re-raise ApiException with status 401/403 so the caller
+        can handle missing permissions (used for optional RBAC verbs). Other ApiExceptions are still
+        logged and swallowed.
+    :param raise_on_error: When True, re-raise *any* ApiException (after logging) instead of
+        swallowing it and returning a partial result. Use when a partial result must not be
+        mistaken for a complete one (e.g. the workload sync, where missing controller nodes would
+        leave pods with unmatched WORKLOAD_PARENT edges and trigger a destructive cleanup).
+    :param kwargs: Keyword arguments to pass to the list function (e.g. limit=100)
+    :return: A list of all resources returned by the list function
+    """
+    all_resources = []
+    for page in k8s_paginate_pages(
+        list_func,
+        raise_on_forbidden=raise_on_forbidden,
+        raise_on_error=raise_on_error,
+        **kwargs,
+    ):
+        all_resources.extend(page)
+
+    logger.debug(
+        "Completed pagination for %s: retrieved %s resources",
+        list_func.__name__,
+        len(all_resources),
+    )
+    return all_resources
+
+
+def k8s_paginate_pages(
+    list_func: Callable,
+    raise_on_forbidden: bool = False,
+    raise_on_error: bool = False,
+    **kwargs: Any,
+) -> Iterator[list[Any]]:
+    """
+    Lazily yield each page of a paginated Kubernetes list call.
+
+    Same semantics as ``k8s_paginate``, but lets the caller transform and drop each page
+    before the next one is fetched. Use this for high-cardinality resources (e.g. pods):
+    the deserialized client models are an order of magnitude larger than the transformed
+    dicts, so holding every page at once can exhaust memory on large clusters.
+    """
+    continue_token = None
+    limit = kwargs.pop("limit", 100)
+    function_name = list_func.__name__
+
+    logger.debug("Starting pagination for %s with limit %s.", function_name, limit)
+
+    while True:
+        try:
+            if continue_token:
+                response = list_func(limit=limit, _continue=continue_token, **kwargs)
+            else:
+                response = list_func(limit=limit, **kwargs)
+        except ApiException as e:
+            is_forbidden = e.status in (401, 403)
+            # 401/403 re-raise quietly so the caller can log a permission-specific
+            # message; other errors are logged here before propagating (or being
+            # swallowed when neither raise flag is set).
+            if is_forbidden and (raise_on_forbidden or raise_on_error):
+                raise
+            logger.error(
+                "Kubernetes API error retrieving %s resources. %s: %s - %s",
+                function_name,
+                e,
+                e.status,
+                e.reason,
+            )
+            if raise_on_error:
+                raise
+            return
+
+        # Check if items exists on the response
+        if not hasattr(response, "items"):
+            logger.warning(
+                "Response from %s does not contain 'items' attribute.", function_name
+            )
+            return
+
+        logger.debug("Retrieved %s %s resources", len(response.items), function_name)
+        yield response.items
+
+        # Check if metadata exists on the response
+        if not hasattr(response, "metadata"):
+            logger.warning(
+                "Response from %s does not contain 'metadata' attribute.", function_name
+            )
+            return
+
+        continue_token = response.metadata._continue
+        if not continue_token:
+            logger.debug("No more %s resources to retrieve.", function_name)
+            return
+
+
+def list_cluster_custom_objects(
+    client: K8sClient,
+    group: str,
+    version: str,
+    plural: str,
+) -> list[dict[str, Any]]:
+    resource_name = f"{group}/{version}/{plural}"
+    all_resources: list[dict[str, Any]] = []
+    continue_token: str | None = None
+
+    while True:
+        kwargs: dict[str, Any] = {}
+        if continue_token:
+            kwargs["_continue"] = continue_token
+
+        try:
+            response = client.custom.list_cluster_custom_object(
+                group=group,
+                version=version,
+                plural=plural,
+                limit=100,
+                **kwargs,
+            )
+        except ApiException as err:
+            if err.status == 404:
+                logger.info(
+                    "Skipping %s for cluster %s because the CRD is not installed.",
+                    resource_name,
+                    client.name,
+                )
+                return []
+
+            logger.warning(
+                "Failed to fetch %s resources for cluster %s: %s",
+                resource_name,
+                client.name,
+                err,
+            )
+            raise
+
+        items = response["items"]
+        all_resources.extend(items)
+
+        continue_token = response.get("metadata", {}).get("continue")
+        if not continue_token:
+            break
+
+    logger.debug("Fetched %d %s resources", len(all_resources), resource_name)
+    return all_resources

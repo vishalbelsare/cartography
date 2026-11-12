@@ -1,0 +1,136 @@
+# Based on: https://github.com/rkdarst/sphinx-actions-test/blob/master/.github/workflows/sphinx-build.yml
+
+name: sphinx
+on:
+  pull_request:
+    branches:
+      - 'master'
+  push:
+    branches:
+      - 'master'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+# Declare default permissions as read only.
+permissions: read-all
+
+env:
+  DEFAULT_BRANCH: "master"
+
+jobs:
+  # Runs on pull requests too, so it executes untrusted code from the branch and is
+  # kept read-only. The rendered site travels to the deploy job as an artifact.
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # https://github.com/marketplace/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+          persist-credentials: false
+      # https://github.com/marketplace/actions/setup-python
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install the project
+        run: uv sync --frozen --group doc
+      # Build
+      - name: Build Sphinx docs
+        run: uv run ./docs/build.sh
+      - name: Upload rendered docs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sphinx-docs
+          path: generated/docs/
+          if-no-files-found: error
+
+  # Only this job writes to the repository, and it never runs on a pull request.
+  deploy:
+    name: Deploy to gh-pages
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.event_name == 'push' }}
+    permissions:
+      contents: write
+    steps:
+      # Full history so the feature-branch pruning below can resolve remote refs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+      - name: Download rendered docs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sphinx-docs
+          path: generated/docs/
+
+      # Clone and set up the old gh-pages branch
+      - name: Clone old gh-pages
+        run: |
+          set -x
+          git fetch
+          ( git branch gh-pages remotes/origin/gh-pages && git clone . --branch=gh-pages _gh-pages/ ) || mkdir _gh-pages
+          rm -rf _gh-pages/.git/
+          mkdir -p _gh-pages/branch/
+      # On the default branch, copy build to _gh-pages/ as the "main" deployment.
+      - name: Copy new build (default branch)
+        if: contains(github.ref, env.DEFAULT_BRANCH)
+        run: |
+          set -x
+          # Delete everything under _gh-pages/ that is from the
+          # primary branch deployment.  Eicludes the other branches
+          # _gh-pages/branch-* paths, and not including
+          # _gh-pages itself.
+          find _gh-pages/ -mindepth 1 ! -path '_gh-pages/branch*' -delete
+          rsync -a generated/docs/ _gh-pages/
+      # Off the default branch, copy the build to _gh-pages/branch/$brname
+      # (transforming '/' into '--')
+      - name: Copy new build (branch)
+        if: ${{ !contains(github.ref, env.DEFAULT_BRANCH) }}
+        run: |
+          set -x
+          brname="$GITHUB_REF"
+          brname="${brname##refs/heads/}"
+          brdir=${brname//\//--}   # replace '/' with '--'
+          rm -rf   _gh-pages/branch/${brdir}
+          rsync -a generated/docs/ _gh-pages/branch/${brdir}
+      # Go through each branch in _gh-pages/branch/, if it's not a
+      # ref, then delete it.
+      - name: Delete old feature branches
+        run: |
+          set -x
+          for brdir in `ls _gh-pages/branch/` ; do
+              brname=${brdir//--/\/}   # replace '--' with '/'
+              if ! git show-ref remotes/origin/$brname ; then
+                  echo "Removing $brdir"
+                  rm -r _gh-pages/branch/$brdir/
+              fi
+          done
+
+      # Add the .nojekyll file
+      - name: nojekyll
+        run: |
+          touch _gh-pages/.nojekyll
+
+      # Deploy
+      # https://github.com/peaceiris/actions-gh-pages
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
+        with:
+          publish_branch: gh-pages
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: _gh-pages/
+          force_orphan: true
+          cname: docs.cartography.dev

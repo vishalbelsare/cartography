@@ -2,32 +2,62 @@
 STORAGE_RESPONSE = {
     "kind": "storage#buckets",
     "items": [
-            {
-                "kind": "storage#bucket",
-                "id": "bucket_name",
-                "selfLink": "https://www.googleapis.com/storage/v1/b/bucket_name",
-                "projectNumber": 9999,
-                "name": "bucket_name",
-                "timeCreated": "some_time",
-                "updated": "some_time",
-                "metageneration": "1",
-                "iamConfiguration": {
-                    "bucketPolicyOnly": {
-                        "enabled": False,
-                    },
-                    "uniformBucketLevelAccess": {
-                        "enabled": False,
-                    },
+        {
+            "kind": "storage#bucket",
+            "id": "bucket_name",
+            "selfLink": "https://www.googleapis.com/storage/v1/b/bucket_name",
+            "projectNumber": 123456789012,
+            "name": "bucket_name",
+            "timeCreated": "some_time",
+            "updated": "some_time",
+            "metageneration": "1",
+            "iamConfiguration": {
+                "bucketPolicyOnly": {
+                    "enabled": False,
                 },
-                "location": "US",
-                "locationType": "multi-region",
-                "defaultEventBasedHold": False,
-                "storageClass": "STANDARD",
-                "etag": "CAE=",
-                "labels": {
-                    "label_key_1": "label_value_1",
-                    "label_key_2": "label_value_2",
+                "uniformBucketLevelAccess": {
+                    "enabled": False,
                 },
+                "publicAccessPrevention": "inherited",
             },
+            "location": "US",
+            "locationType": "multi-region",
+            "defaultEventBasedHold": False,
+            "storageClass": "STANDARD",
+            "etag": "CAE=",
+            "labels": {
+                "label_key_1": "label_value_1",
+                "label_key_2": "label_value_2",
+            },
+            "acl": [
+                {
+                    "entity": "project-owners-123456789012",
+                    "role": "OWNER",
+                },
+                {
+                    "entity": "allUsers",
+                    "role": "READER",
+                },
+            ],
+            "defaultObjectAcl": [
+                {
+                    "entity": "project-owners-123456789012",
+                    "role": "OWNER",
+                },
+            ],
+        },
+        {
+            "kind": "storage#bucket",
+            "id": "bucket_name_2",
+            "selfLink": "https://www.googleapis.com/storage/v1/b/bucket_name_2",
+            "projectNumber": 123456789012,
+            "name": "bucket_name_2",
+            "location": "US",
+            "locationType": "multi-region",
+            "storageClass": "STANDARD",
+            "labels": {
+                "label_key_1": "label_value_3",
+            },
+        },
     ],
 }

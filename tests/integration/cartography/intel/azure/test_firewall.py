@@ -1,0 +1,602 @@
+import json
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+import pytest
+from azure.mgmt.network.models import AzureFirewall
+from azure.mgmt.network.models import FirewallPolicy
+from azure.mgmt.network.models import FirewallPolicyRuleCollectionGroup
+
+import cartography.intel.azure.firewall as firewall
+from tests.data.azure.firewall import DESCRIBE_FIREWALL_POLICIES
+from tests.data.azure.firewall import DESCRIBE_FIREWALL_POLICIES_ARM
+from tests.data.azure.firewall import DESCRIBE_FIREWALL_POLICY_RULE_GROUPS
+from tests.data.azure.firewall import DESCRIBE_FIREWALL_POLICY_RULE_GROUPS_ARM
+from tests.data.azure.firewall import DESCRIBE_FIREWALLS
+from tests.data.azure.firewall import DESCRIBE_FIREWALLS_ARM
+from tests.integration.util import check_nodes
+from tests.integration.util import check_rels
+
+TEST_SUBSCRIPTION_ID = "00-00-00-00"
+TEST_UPDATE_TAG = 123456789
+
+
+@pytest.mark.parametrize(
+    ("firewalls_response", "policies_response", "rule_groups_response"),
+    [
+        (
+            DESCRIBE_FIREWALLS,
+            DESCRIBE_FIREWALL_POLICIES,
+            DESCRIBE_FIREWALL_POLICY_RULE_GROUPS,
+        ),
+        # azure-mgmt-network 31+ serializes in ARM wire format.
+        (
+            [AzureFirewall(fw).as_dict() for fw in DESCRIBE_FIREWALLS_ARM],
+            [FirewallPolicy(p).as_dict() for p in DESCRIBE_FIREWALL_POLICIES_ARM],
+            [
+                FirewallPolicyRuleCollectionGroup(g).as_dict()
+                for g in DESCRIBE_FIREWALL_POLICY_RULE_GROUPS_ARM
+            ],
+        ),
+    ],
+    ids=["flattened_sdk_shape", "current_sdk_shape"],
+)
+@patch("cartography.intel.azure.firewall.get_ip_groups")
+@patch("cartography.intel.azure.firewall.get_firewall_policy_rule_groups")
+@patch("cartography.intel.azure.firewall.get_firewall_policies")
+@patch("cartography.intel.azure.firewall.get_firewalls")
+@patch("cartography.intel.azure.firewall.get_client")
+def test_sync_azure_firewalls(
+    mock_get_client,
+    mock_get_firewalls,
+    mock_get_policies,
+    mock_get_rule_groups,
+    mock_get_ip_groups,
+    firewalls_response,
+    policies_response,
+    rule_groups_response,
+    neo4j_session,
+):
+    """
+    Test that we can correctly sync Azure Firewall, Firewall Policy,
+    and Firewall IP Configuration data and their relationships.
+    """
+    # Arrange
+    neo4j_session.run("MATCH (n) DETACH DELETE n")
+    mock_client = MagicMock()
+    mock_get_client.return_value = mock_client
+    mock_get_firewalls.return_value = firewalls_response
+    mock_get_policies.return_value = policies_response
+    rule_groups_by_policy = {
+        DESCRIBE_FIREWALL_POLICIES[0]["id"]: rule_groups_response,
+    }
+    mock_get_rule_groups.side_effect = (
+        lambda _client, policy_id: rule_groups_by_policy.get(policy_id, [])
+    )
+    mock_get_ip_groups.return_value = []  # No IP groups for this test
+
+    # Create the prerequisite AzureSubscription node
+    neo4j_session.run(
+        "MERGE (s:AzureSubscription{id: $sub_id}) SET s.lastupdated = $tag",
+        sub_id=TEST_SUBSCRIPTION_ID,
+        tag=TEST_UPDATE_TAG,
+    )
+
+    # Create prerequisite AzureVirtualNetwork node for firewall-1
+    neo4j_session.run(
+        """
+        MERGE (vnet:AzureVirtualNetwork{id: $vnet_id})
+        SET vnet.lastupdated = $tag
+        """,
+        vnet_id="/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/virtualNetworks/test-vnet",
+        tag=TEST_UPDATE_TAG,
+    )
+
+    # Create prerequisite AzureSubnet nodes for IP configurations
+    neo4j_session.run(
+        """
+        MERGE (subnet:AzureSubnet{id: $subnet_id})
+        SET subnet.lastupdated = $tag
+        """,
+        subnet_id="/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/virtualNetworks/test-vnet/subnets/AzureFirewallSubnet",
+        tag=TEST_UPDATE_TAG,
+    )
+
+    neo4j_session.run(
+        """
+        MERGE (subnet:AzureSubnet{id: $subnet_id})
+        SET subnet.lastupdated = $tag
+        """,
+        subnet_id="/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/virtualNetworks/test-vnet/subnets/AzureFirewallManagementSubnet",
+        tag=TEST_UPDATE_TAG,
+    )
+
+    # Create prerequisite AzurePublicIPAddress nodes for IP configurations
+    public_ip_ids = [
+        "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/publicIPAddresses/fw-pip-1",
+        "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/publicIPAddresses/fw-pip-2",
+        "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/publicIPAddresses/fw-mgmt-pip",
+    ]
+    for pip_id in public_ip_ids:
+        neo4j_session.run(
+            """
+            MERGE (pip:AzurePublicIPAddress{id: $pip_id})
+            SET pip.lastupdated = $tag
+            """,
+            pip_id=pip_id,
+            tag=TEST_UPDATE_TAG,
+        )
+
+    common_job_parameters = {
+        "UPDATE_TAG": TEST_UPDATE_TAG,
+        "AZURE_SUBSCRIPTION_ID": TEST_SUBSCRIPTION_ID,
+    }
+
+    # Act
+    firewall.sync(
+        neo4j_session,
+        mock_client,
+        TEST_SUBSCRIPTION_ID,
+        TEST_UPDATE_TAG,
+        common_job_parameters,
+    )
+
+    # Assert - Check AzureFirewall nodes
+    expected_firewall_nodes = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1",
+            "test-firewall-1",
+            "eastus",
+            "Premium",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-2",
+            "test-firewall-2",
+            "westus",
+            "Standard",
+        ),
+    }
+    assert (
+        check_nodes(
+            neo4j_session, "AzureFirewall", ["id", "name", "location", "sku_tier"]
+        )
+        == expected_firewall_nodes
+    )
+
+    # Assert - Check AzureFirewallPolicy nodes
+    expected_policy_nodes = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-1",
+            "test-policy-1",
+            "Alert",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-2",
+            "test-policy-2",
+            "Deny",
+        ),
+    }
+    assert (
+        check_nodes(
+            neo4j_session, "AzureFirewallPolicy", ["id", "name", "threat_intel_mode"]
+        )
+        == expected_policy_nodes
+    )
+
+    # Assert - Check AzureSubscription -> AzureFirewallPolicy relationship
+    # The relationship direction is INWARD, meaning (:AzureSubscription)-[:RESOURCE]->(:AzureFirewallPolicy)
+    expected_sub_policy_rels = {
+        (
+            TEST_SUBSCRIPTION_ID,
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-1",
+        ),
+        (
+            TEST_SUBSCRIPTION_ID,
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-2",
+        ),
+    }
+    assert (
+        check_rels(
+            neo4j_session,
+            "AzureSubscription",
+            "id",
+            "AzureFirewallPolicy",
+            "id",
+            "RESOURCE",
+            rel_direction_right=True,
+        )
+        == expected_sub_policy_rels
+    )
+
+    # Assert - Check AzureFirewallPolicy -> AzureFirewallPolicy (INHERITS_FROM) relationship
+    # test-policy-2 inherits from test-policy-1 (parent/base policy)
+    expected_policy_inheritance_rels = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-2",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-1",
+        ),
+    }
+    assert (
+        check_rels(
+            neo4j_session,
+            "AzureFirewallPolicy",
+            "id",
+            "AzureFirewallPolicy",
+            "id",
+            "INHERITS_FROM",
+            rel_direction_right=True,
+        )
+        == expected_policy_inheritance_rels
+    )
+
+    # Assert - Check AzureFirewallIPConfiguration nodes
+    expected_ip_config_nodes = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/ipconfig1",
+            "ipconfig1",
+            "10.0.1.4",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/ipconfig2",
+            "ipconfig2",
+            "10.0.1.5",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/mgmt-ipconfig",
+            "mgmt-ipconfig",
+            "10.0.1.10",
+        ),
+    }
+    assert (
+        check_nodes(
+            neo4j_session,
+            "AzureFirewallIPConfiguration",
+            ["id", "name", "private_ip_address"],
+        )
+        == expected_ip_config_nodes
+    )
+
+    # Assert - Check AzureSubscription <- AzureFirewall relationship
+    # The relationship direction is INWARD, meaning (:AzureSubscription)<-[:RESOURCE]-(:AzureFirewall)
+    expected_sub_fw_rels = {
+        (
+            TEST_SUBSCRIPTION_ID,
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1",
+        ),
+        (
+            TEST_SUBSCRIPTION_ID,
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-2",
+        ),
+    }
+    assert (
+        check_rels(
+            neo4j_session,
+            "AzureSubscription",
+            "id",
+            "AzureFirewall",
+            "id",
+            "RESOURCE",
+            rel_direction_right=True,  # Changed from False - relationship points from Firewall to Subscription
+        )
+        == expected_sub_fw_rels
+    )
+
+    # Assert - Check AzureFirewall -> AzureFirewallPolicy relationship
+    expected_fw_policy_rels = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-1",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-2",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-2",
+        ),
+    }
+    assert (
+        check_rels(
+            neo4j_session,
+            "AzureFirewall",
+            "id",
+            "AzureFirewallPolicy",
+            "id",
+            "USES_POLICY",
+            rel_direction_right=True,
+        )
+        == expected_fw_policy_rels
+    )
+
+    # Assert - Check AzureFirewall <- AzureFirewallIPConfiguration relationship
+    # The relationship direction is INWARD, meaning (:AzureFirewall)<-[:HAS_IP_CONFIGURATION]-(:AzureFirewallIPConfiguration)
+    expected_fw_ipconfig_rels = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/ipconfig1",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/ipconfig2",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/mgmt-ipconfig",
+        ),
+    }
+    assert (
+        check_rels(
+            neo4j_session,
+            "AzureFirewall",
+            "id",
+            "AzureFirewallIPConfiguration",
+            "id",
+            "HAS_IP_CONFIGURATION",
+            rel_direction_right=True,  # Changed from False - relationship points from IPConfig to Firewall
+        )
+        == expected_fw_ipconfig_rels
+    )
+
+    # Assert - Check AzureFirewallIPConfiguration -> AzureSubnet relationship
+    expected_ipconfig_subnet_rels = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/ipconfig1",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/virtualNetworks/test-vnet/subnets/AzureFirewallSubnet",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/ipconfig2",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/virtualNetworks/test-vnet/subnets/AzureFirewallSubnet",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/mgmt-ipconfig",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/virtualNetworks/test-vnet/subnets/AzureFirewallManagementSubnet",
+        ),
+    }
+    assert (
+        check_rels(
+            neo4j_session,
+            "AzureFirewallIPConfiguration",
+            "id",
+            "AzureSubnet",
+            "id",
+            "IN_SUBNET",
+            rel_direction_right=True,
+        )
+        == expected_ipconfig_subnet_rels
+    )
+
+    # Assert - Check AzureFirewallIPConfiguration -> AzurePublicIPAddress relationship
+    expected_ipconfig_pip_rels = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/ipconfig1",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/publicIPAddresses/fw-pip-1",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/ipconfig2",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/publicIPAddresses/fw-pip-2",
+        ),
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1/azureFirewallIpConfigurations/mgmt-ipconfig",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/publicIPAddresses/fw-mgmt-pip",
+        ),
+    }
+    assert (
+        check_rels(
+            neo4j_session,
+            "AzureFirewallIPConfiguration",
+            "id",
+            "AzurePublicIPAddress",
+            "id",
+            "USES_PUBLIC_IP",
+            rel_direction_right=True,
+        )
+        == expected_ipconfig_pip_rels
+    )
+
+    # Assert - Check AzureFirewall -> AzureVirtualNetwork relationship
+    expected_fw_vnet_rels = {
+        (
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/test-firewall-1",
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/virtualNetworks/test-vnet",
+        ),
+    }
+    assert (
+        check_rels(
+            neo4j_session,
+            "AzureFirewall",
+            "id",
+            "AzureVirtualNetwork",
+            "id",
+            "MEMBER_OF",
+            rel_direction_right=True,
+        )
+        == expected_fw_vnet_rels
+    )
+
+    # Assert - Rules stored as JSON keep the flattened snake_case shape on any SDK
+    firewall_rules = neo4j_session.run(
+        """
+        MATCH (f:AzureFirewall {name: 'test-firewall-1'})
+        RETURN f.network_rule_collections AS network,
+               f.application_rule_collections AS application,
+               f.nat_rule_collections AS nat
+        """
+    ).single()
+    legacy_firewall = DESCRIBE_FIREWALLS[0]
+    assert (
+        json.loads(firewall_rules["network"])
+        == legacy_firewall["network_rule_collections"]
+    )
+    assert (
+        json.loads(firewall_rules["application"])
+        == legacy_firewall["application_rule_collections"]
+    )
+    assert json.loads(firewall_rules["nat"]) == legacy_firewall["nat_rule_collections"]
+    policy_rules = {
+        row["name"]: row["detail"]
+        for row in neo4j_session.run(
+            "MATCH (p:AzureFirewallPolicy) RETURN p.name AS name, p.rule_groups_detail AS detail"
+        )
+    }
+    assert (
+        json.loads(policy_rules["test-policy-1"])
+        == DESCRIBE_FIREWALL_POLICY_RULE_GROUPS
+    )
+    assert policy_rules["test-policy-2"] is None
+
+    # Assert - Security settings that live under "properties" on the wire
+    assert check_nodes(
+        neo4j_session,
+        "AzureFirewall",
+        [
+            "name",
+            "provisioning_state",
+            "autoscale_max_capacity",
+            "hub_private_ip_address",
+            "hub_public_ip_count",
+        ],
+    ) == {
+        ("test-firewall-1", "Succeeded", 10, None, 0),
+        ("test-firewall-2", "Succeeded", None, "10.1.0.4", 2),
+    }
+    assert check_nodes(
+        neo4j_session,
+        "AzureFirewallPolicy",
+        [
+            "name",
+            "dns_enable_proxy",
+            "explicit_proxy_https_port",
+            "intrusion_detection_mode",
+            "insights_retention_days",
+            "transport_security_key_vault_secret_id",
+            "base_policy_id",
+        ],
+    ) == {
+        (
+            "test-policy-1",
+            True,
+            8443,
+            "Alert",
+            90,
+            "https://myvault.vault.azure.net/secrets/root-ca",
+            None,
+        ),
+        (
+            "test-policy-2",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/test-policy-1",
+        ),
+    }
+
+
+@patch("cartography.intel.azure.firewall.get_ip_groups")
+@patch("cartography.intel.azure.firewall.get_firewall_policy_rule_groups")
+@patch("cartography.intel.azure.firewall.get_firewall_policies")
+@patch("cartography.intel.azure.firewall.get_firewalls")
+@patch("cartography.intel.azure.firewall.get_client")
+def test_sync_azure_firewalls_cleanup(
+    mock_get_client,
+    mock_get_firewalls,
+    mock_get_policies,
+    mock_get_rule_groups,
+    mock_get_ip_groups,
+    neo4j_session,
+):
+    """
+    Test that stale Azure Firewall data is properly cleaned up.
+    """
+    # Arrange - Create old data with different update tags
+    old_update_tag = TEST_UPDATE_TAG - 1000
+
+    # Create the prerequisite AzureSubscription node
+    neo4j_session.run(
+        "MERGE (s:AzureSubscription{id: $sub_id}) SET s.lastupdated = $tag",
+        sub_id=TEST_SUBSCRIPTION_ID,
+        tag=TEST_UPDATE_TAG,
+    )
+
+    # Create old firewall that should be cleaned up
+    neo4j_session.run(
+        """
+        MERGE (fw:AzureFirewall{id: $fw_id})
+        SET fw.name = 'old-firewall', fw.lastupdated = $old_tag
+        WITH fw
+        MATCH (s:AzureSubscription{id: $sub_id})
+        MERGE (fw)<-[r:RESOURCE]-(s)
+        SET r.lastupdated = $old_tag
+        """,
+        fw_id="/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/old-firewall",
+        sub_id=TEST_SUBSCRIPTION_ID,
+        old_tag=old_update_tag,
+    )
+
+    # Create old IP configuration that should be cleaned up
+    neo4j_session.run(
+        """
+        MERGE (ip:AzureFirewallIPConfiguration{id: $ip_id})
+        SET ip.name = 'old-ipconfig', ip.lastupdated = $old_tag
+        WITH ip
+        MATCH (s:AzureSubscription{id: $sub_id})
+        MERGE (ip)<-[r:RESOURCE]-(s)
+        SET r.lastupdated = $old_tag
+        """,
+        ip_id="/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/azureFirewalls/old-firewall/azureFirewallIpConfigurations/old-ipconfig",
+        sub_id=TEST_SUBSCRIPTION_ID,
+        old_tag=old_update_tag,
+    )
+
+    # Create old policy that should be cleaned up
+    neo4j_session.run(
+        """
+        MERGE (p:AzureFirewallPolicy{id: $policy_id})
+        SET p.name = 'old-policy', p.lastupdated = $old_tag
+        WITH p
+        MATCH (s:AzureSubscription{id: $sub_id})
+        MERGE (s)-[r:RESOURCE]->(p)
+        SET r.lastupdated = $old_tag
+        """,
+        policy_id="/subscriptions/00-00-00-00/resourceGroups/TestRG/providers/Microsoft.Network/firewallPolicies/old-policy",
+        sub_id=TEST_SUBSCRIPTION_ID,
+        old_tag=old_update_tag,
+    )
+
+    # Mock empty results from API (simulating resources were deleted)
+    mock_client = MagicMock()
+    mock_get_client.return_value = mock_client
+    mock_get_firewalls.return_value = []
+    mock_get_policies.return_value = []
+    mock_get_rule_groups.return_value = []
+    mock_get_ip_groups.return_value = []
+
+    common_job_parameters = {
+        "UPDATE_TAG": TEST_UPDATE_TAG,
+        "AZURE_SUBSCRIPTION_ID": TEST_SUBSCRIPTION_ID,
+    }
+
+    # Act
+    firewall.sync(
+        neo4j_session,
+        mock_client,
+        TEST_SUBSCRIPTION_ID,
+        TEST_UPDATE_TAG,
+        common_job_parameters,
+    )
+
+    # Assert - Old firewall should be removed
+    result = neo4j_session.run(
+        "MATCH (fw:AzureFirewall{name: 'old-firewall'}) RETURN count(fw) as count"
+    )
+    assert result.single()["count"] == 0
+
+    # Assert - Old IP configuration should be removed
+    result = neo4j_session.run(
+        "MATCH (ip:AzureFirewallIPConfiguration{name: 'old-ipconfig'}) RETURN count(ip) as count"
+    )
+    assert result.single()["count"] == 0
+
+    # Assert - Old policy should be removed
+    result = neo4j_session.run(
+        "MATCH (p:AzureFirewallPolicy{name: 'old-policy'}) RETURN count(p) as count"
+    )
+    assert result.single()["count"] == 0

@@ -1,0 +1,768 @@
+import json
+import logging
+import os
+from typing import Any
+
+import boto3
+from neo4j import Session
+
+from cartography.client.core.tx import load
+from cartography.client.core.tx import run_write_query
+from cartography.graph.job import GraphJob
+from cartography.intel.common.object_store import filter_report_refs
+from cartography.intel.common.object_store import read_text_report
+from cartography.intel.common.object_store import ReportRef
+from cartography.intel.common.object_store import S3BucketReader
+from cartography.intel.trivy.util import canonical_cve_id
+from cartography.intel.trivy.util import make_normalized_package_id
+from cartography.models.trivy.findings import TrivyImageFindingSchema
+from cartography.models.trivy.fix import TrivyFixSchema
+from cartography.models.trivy.package import TrivyPackageSchema
+from cartography.stats import get_stats_client
+from cartography.util import timeit
+
+logger = logging.getLogger(__name__)
+stat_handler = get_stats_client(__name__)
+
+_SEVERITY_RANK = {"UNKNOWN": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+# Among a finding's packages, prefer one with no fix available (affected,
+# will_not_fix, fix_deferred, ...: every status missing from this map) over one
+# with a fix available (fixed: the installed version is still vulnerable), and
+# either over not_affected.
+_STATUS_PREFERENCE = {"not_affected": 0, "fixed": 1}
+_NO_FIX_PREFERENCE = 2
+# Trivy names the results of these types after their ecosystem, such as "Python",
+# instead of a file. It merges the packages it finds in site-packages, node_modules,
+# gemspecs, and JARs into one result and records each package's own file on the
+# package, but not for every package: pip's vendored packages have none. The report has
+# no field that marks these results, so this mirrors the keys of PkgTargets in Trivy's
+# pkg/scan/langpkg/scan.go.
+_LABELED_TARGET_TYPES = frozenset(
+    {"conda-pkg", "gemspec", "jar", "kubernetes", "node-pkg", "python-pkg"},
+)
+
+
+def _validate_packages(package_list: list[dict]) -> list[dict]:
+    """
+    Validates that each package has the required fields.
+    Returns only packages that have both InstalledVersion and PkgName.
+    """
+    validated_packages: list[dict] = []
+    for pkg in package_list:
+        if (
+            "InstalledVersion" in pkg
+            and pkg["InstalledVersion"]
+            and "PkgName" in pkg
+            and pkg["PkgName"]
+        ):
+            validated_packages.append(pkg)
+        else:
+            logger.warning(
+                "Package object does not have required fields `InstalledVersion` or `PkgName` - skipping."
+            )
+    return validated_packages
+
+
+def _result_file(scan_class: dict) -> str | None:
+    # An OS package result's Target names the artifact and its distribution.
+    if (
+        scan_class.get("Class") != "lang-pkgs"
+        or scan_class.get("Type") in _LABELED_TARGET_TYPES
+    ):
+        return None
+    return scan_class.get("Target") or None
+
+
+def _package_locations(results: list[dict]) -> dict[str, list[str]]:
+    """
+    Map each package ID to the files in the scanned artifact that contain it.
+
+    One report can list the same package in several results, for example the Go
+    standard library compiled into several binaries, so the files of every result
+    are merged before they are written to the package's DEPLOYED relationship.
+    """
+    locations: dict[str, set[str]] = {}
+    for scan_class in results:
+        result_file = _result_file(scan_class)
+        found = [
+            (vuln.get("InstalledVersion"), vuln.get("PkgName"), vuln.get("PkgPath"))
+            for vuln in scan_class.get("Vulnerabilities") or []
+        ] + [
+            (pkg.get("Version"), pkg.get("Name"), pkg.get("FilePath"))
+            for pkg in scan_class.get("Packages") or []
+        ]
+        for version, name, path in found:
+            if path := path or result_file:
+                locations.setdefault(f"{version}|{name}", set()).add(path)
+    return {package_id: sorted(files) for package_id, files in locations.items()}
+
+
+def _target_rating_key(row: dict[str, Any]) -> tuple[int, bool, int, bool]:
+    source = row.get("SeveritySource")
+    return (
+        _SEVERITY_RANK.get((row.get("Severity") or "").upper(), 0),
+        # Trivy names the distribution or ecosystem database when it has one and
+        # falls back to nvd (or names nothing) otherwise; the named rating is the
+        # one that applies to the package as built.
+        bool(source) and source != "nvd",
+        _STATUS_PREFERENCE.get(row.get("Status") or "", _NO_FIX_PREFERENCE),
+        row.get("Class") == "os-pkgs",
+    )
+
+
+def _set_target_ratings(findings_list: list[dict[str, Any]]) -> None:
+    """
+    A report is one scan target, and the AFFECTS edge to that target is merged
+    once per package row, so every row of a finding must carry the same rating or
+    the edge would keep whichever package happened to come last.
+    """
+    rows_by_finding: dict[str, list[dict[str, Any]]] = {}
+    for row in findings_list:
+        rows_by_finding.setdefault(row["id"], []).append(row)
+
+    for rows in rows_by_finding.values():
+        # max() keeps the first maximal row, so a full tie goes to report order.
+        rating = max(rows, key=_target_rating_key)
+        for row in rows:
+            row["TargetSeverity"] = rating["Severity"]
+            row["TargetSeveritySource"] = rating["SeveritySource"]
+            row["TargetStatus"] = rating["Status"]
+            row["TargetDataSourceID"] = rating["DataSourceID"]
+
+
+def transform_scan_results(
+    results: list[dict],
+    image_digest: str | None,
+    filesystem_snapshot_ids: list[str] | None = None,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    Transform raw Trivy scan results into a format suitable for loading into Neo4j.
+    Returns a tuple of (findings_list, packages_list, fixes_list).
+    """
+    findings_list = []
+    packages_list = []
+    fixes_list = []
+    package_locations = _package_locations(results)
+
+    for scan_class in results:
+        # Sometimes a scan class will have no vulns and Trivy will leave the key undefined instead of showing [].
+        if "Vulnerabilities" in scan_class and scan_class["Vulnerabilities"]:
+            for result in scan_class["Vulnerabilities"]:
+                # Extract layer info if available
+                layer_digest = None
+                layer_diff_id = None
+                if "Layer" in result:
+                    layer_digest = result["Layer"].get("Digest")
+                    layer_diff_id = result["Layer"].get("DiffID")
+
+                # Extract data source info if available
+                data_source_id = None
+                data_source_name = None
+                if "DataSource" in result:
+                    data_source_id = result["DataSource"].get("ID")
+                    data_source_name = result["DataSource"].get("Name")
+
+                # Trivy reports more than CVEs: GHSA-, DLA-/DSA-, TEMP-, RUSTSEC-, etc.
+                # The primary identifier lives in VulnerabilityID, and vendor advisory
+                # ids (e.g. RHSA-, DSA-) in VendorIDs. Keep the whole set on the finding
+                # and classify it, so an identifier is recognised whichever slot it
+                # appears in and no authority is dropped for lack of a dedicated field.
+                # cve_id gates the :CVE label.
+                vuln_id = result["VulnerabilityID"]
+                vulnerability_ids = list(
+                    dict.fromkeys([vuln_id, *(result.get("VendorIDs") or [])]),
+                )
+                cve_id = next(
+                    (cid for cid in map(canonical_cve_id, vulnerability_ids) if cid),
+                    None,
+                )
+                ghsa_id = next(
+                    (vid for vid in vulnerability_ids if vid.startswith("GHSA-")),
+                    None,
+                )
+
+                # Transform finding data
+                finding = {
+                    "id": f"TIF|{vuln_id}",
+                    "VulnerabilityID": vuln_id,
+                    "vulnerability_ids": vulnerability_ids,
+                    "cve_id": cve_id,
+                    "ghsa_id": ghsa_id,
+                    "has_cve": "true" if cve_id else "false",
+                    "Description": result.get("Description"),
+                    "LastModifiedDate": result.get("LastModifiedDate"),
+                    "PrimaryURL": result.get("PrimaryURL"),
+                    "PublishedDate": result.get("PublishedDate"),
+                    "Severity": result["Severity"],
+                    "SeveritySource": result.get("SeveritySource"),
+                    "Title": result.get("Title"),
+                    "nvd_v2_score": None,
+                    "nvd_v2_vector": None,
+                    "nvd_v3_score": None,
+                    "nvd_v3_vector": None,
+                    "redhat_v3_score": None,
+                    "redhat_v3_vector": None,
+                    "ubuntu_v3_score": None,
+                    "ubuntu_v3_vector": None,
+                    "Class": scan_class["Class"],
+                    "Type": scan_class["Type"],
+                    "ImageDigest": image_digest,  # For AFFECTS relationship
+                    "FilesystemSnapshotIds": filesystem_snapshot_ids or [],
+                    # Additional fields
+                    "CweIDs": result.get("CweIDs"),
+                    "Status": result.get("Status"),
+                    "References": result.get("References"),
+                    "DataSourceID": data_source_id,
+                    "DataSourceName": data_source_name,
+                    "LayerDigest": layer_digest,
+                    "LayerDiffID": layer_diff_id,
+                }
+
+                # Add CVSS scores if available
+                if "CVSS" in result:
+                    if "nvd" in result["CVSS"]:
+                        nvd = result["CVSS"]["nvd"]
+                        finding["nvd_v2_score"] = nvd.get("V2Score")
+                        finding["nvd_v2_vector"] = nvd.get("V2Vector")
+                        finding["nvd_v3_score"] = nvd.get("V3Score")
+                        finding["nvd_v3_vector"] = nvd.get("V3Vector")
+                    if "redhat" in result["CVSS"]:
+                        redhat = result["CVSS"]["redhat"]
+                        finding["redhat_v3_score"] = redhat.get("V3Score")
+                        finding["redhat_v3_vector"] = redhat.get("V3Vector")
+                    if "ubuntu" in result["CVSS"]:
+                        ubuntu = result["CVSS"]["ubuntu"]
+                        finding["ubuntu_v3_score"] = ubuntu.get("V3Score")
+                        finding["ubuntu_v3_vector"] = ubuntu.get("V3Vector")
+
+                findings_list.append(finding)
+
+                # Extract PURL if available
+                purl = None
+                if "PkgIdentifier" in result:
+                    purl = result["PkgIdentifier"].get("PURL")
+
+                # Transform package data
+                package_id = f"{result['InstalledVersion']}|{result['PkgName']}"
+
+                # Compute normalized ID for cross-tool matching
+                # This enables Syft to match packages despite naming differences
+                normalized_id = make_normalized_package_id(
+                    purl=purl,
+                    name=result["PkgName"],
+                    version=result["InstalledVersion"],
+                    pkg_type=scan_class["Type"],
+                )
+
+                packages_list.append(
+                    {
+                        "id": package_id,
+                        "InstalledVersion": result["InstalledVersion"],
+                        "PkgName": result["PkgName"],
+                        "Class": scan_class["Class"],
+                        "Type": scan_class["Type"],
+                        "ImageDigest": image_digest,  # For DEPLOYED relationship
+                        "FilesystemSnapshotIds": filesystem_snapshot_ids or [],
+                        "Locations": package_locations.get(package_id),
+                        "FindingId": finding["id"],  # For AFFECTS relationship
+                        # Additional fields
+                        "PURL": purl,
+                        "PkgID": result.get("PkgID"),
+                        "normalized_id": normalized_id,
+                    }
+                )
+
+                # Transform fix data if available
+                if result.get("FixedVersion") is not None:
+                    fixes_list.append(
+                        {
+                            "id": f"{result['FixedVersion']}|{result['PkgName']}",
+                            "FixedVersion": result["FixedVersion"],
+                            "PackageId": package_id,
+                            "FindingId": finding["id"],
+                        }
+                    )
+
+    _set_target_ratings(findings_list)
+
+    # Validate packages before returning
+    packages_list = _validate_packages(packages_list)
+    return findings_list, packages_list, fixes_list
+
+
+def transform_all_packages(
+    results: list[dict],
+    image_digest: str | None,
+    seen_ids: set[str],
+    filesystem_snapshot_ids: list[str] | None = None,
+) -> list[dict]:
+    """
+    Transform Trivy Packages arrays into package dicts for loading.
+
+    With --list-all-pkgs, Trivy includes a Packages array per result class
+    containing ALL installed packages, not just vulnerable ones. This function
+    extracts those packages, skipping any already loaded from the Vulnerabilities
+    array (to avoid overwriting their FindingId).
+
+    Args:
+        results: Raw Trivy scan Results array
+        image_digest: Image digest for DEPLOYED relationship
+        seen_ids: Set of package IDs already loaded (from transform_scan_results)
+
+    Returns:
+        List of package dicts ready for load_scan_packages()
+    """
+    packages_list: list[dict] = []
+    package_locations = _package_locations(results)
+    for scan_class in results:
+        if "Packages" not in scan_class or not scan_class["Packages"]:
+            continue
+
+        class_name = scan_class.get("Class", "")
+        pkg_type = scan_class.get("Type", "")
+
+        for pkg in scan_class["Packages"]:
+            name = pkg.get("Name")
+            version = pkg.get("Version")
+            if not name or not version:
+                continue
+
+            package_id = f"{version}|{name}"
+            if package_id in seen_ids:
+                continue
+            seen_ids.add(package_id)
+
+            purl = None
+            if "Identifier" in pkg and pkg["Identifier"]:
+                purl = pkg["Identifier"].get("PURL")
+
+            normalized_id = make_normalized_package_id(
+                purl=purl,
+                name=name,
+                version=version,
+                pkg_type=pkg_type,
+            )
+
+            packages_list.append(
+                {
+                    "id": package_id,
+                    "InstalledVersion": version,
+                    "PkgName": name,
+                    "Class": class_name,
+                    "Type": pkg_type,
+                    "ImageDigest": image_digest,
+                    "FilesystemSnapshotIds": filesystem_snapshot_ids or [],
+                    "Locations": package_locations.get(package_id),
+                    "FindingId": None,
+                    "PURL": purl,
+                    "PkgID": pkg.get("ID"),
+                    "normalized_id": normalized_id,
+                },
+            )
+
+    return _validate_packages(packages_list)
+
+
+def _parse_trivy_data(
+    trivy_data: dict, source: str
+) -> tuple[str | None, list[dict], str]:
+    """
+    Parse Trivy scan data and extract common fields.
+
+    Args:
+        trivy_data: Raw JSON Trivy data
+        source: Source identifier for error messages (file path or S3 URI)
+
+    Returns:
+        Tuple of (artifact_name, results, image_digest)
+    """
+    # Extract artifact name if present (only for file-based)
+    artifact_name = trivy_data.get("ArtifactName")
+
+    results = trivy_data.get("Results", [])
+    if not results:
+        stat_handler.incr("image_scan_no_results_count")
+        logger.info(f"No vulnerabilities found for {source}")
+
+    if "Metadata" not in trivy_data or not trivy_data["Metadata"]:
+        raise ValueError(f"Missing 'Metadata' in scan data for {source}")
+
+    repo_digests = trivy_data["Metadata"].get("RepoDigests", [])
+    if not repo_digests:
+        raise ValueError(f"Missing 'RepoDigests' in scan metadata for {source}")
+
+    repo_digest = repo_digests[0]
+    if "@" not in repo_digest:
+        raise ValueError(f"Invalid repo digest format in {source}: {repo_digest}")
+
+    image_digest = repo_digest.split("@")[1]
+    if not image_digest:
+        raise ValueError(f"Empty image digest for {source}")
+
+    return artifact_name, results, image_digest
+
+
+@timeit
+def sync_single_image(
+    neo4j_session: Session,
+    trivy_data: dict,
+    source: str,
+    update_tag: int,
+) -> None:
+    """
+    Sync a single image's Trivy scan results to Neo4j.
+
+    Args:
+        neo4j_session: Neo4j session for database operations
+        trivy_data: Raw Trivy JSON data
+        source: Source identifier for logging (file path or image URI)
+        update_tag: Update tag for tracking
+    """
+    try:
+        _, results, image_digest = _parse_trivy_data(trivy_data, source)
+        num_findings = _sync_scan_results(
+            neo4j_session,
+            results,
+            source,
+            update_tag,
+            image_digest=image_digest,
+        )
+        stat_handler.incr("image_scan_cve_count", num_findings)
+        stat_handler.incr("images_processed_count")
+
+    except Exception as e:
+        logger.error(f"Failed to process scan results for {source}: {e}")
+        raise
+
+
+@timeit
+def sync_single_filesystem_snapshot(
+    neo4j_session: Session,
+    trivy_data: dict,
+    filesystem_snapshot_ids: list[str],
+    source: str,
+    update_tag: int,
+) -> None:
+    """Sync one Trivy filesystem, repository, or VM report to matching snapshots."""
+    try:
+        artifact_type = trivy_data.get("ArtifactType")
+        if artifact_type not in {"filesystem", "repository", "vm"}:
+            raise ValueError(
+                f"Expected a filesystem, repository, or VM Trivy report for {source}",
+            )
+        if not filesystem_snapshot_ids:
+            raise ValueError(f"No filesystem snapshot targets for {source}")
+
+        results = trivy_data.get("Results") or []
+        if not results:
+            logger.debug("No vulnerabilities found for %s", source)
+
+        num_findings = _sync_scan_results(
+            neo4j_session,
+            results,
+            source,
+            update_tag,
+            filesystem_snapshot_ids=filesystem_snapshot_ids,
+        )
+        stat_handler.incr("filesystem_scan_cve_count", num_findings)
+        stat_handler.incr("filesystem_scans_processed_count")
+    except Exception as exc:
+        logger.error("Failed to process scan results for %s: %s", source, exc)
+        raise
+
+
+def _sync_scan_results(
+    neo4j_session: Session,
+    results: list[dict],
+    source: str,
+    update_tag: int,
+    *,
+    image_digest: str | None = None,
+    filesystem_snapshot_ids: list[str] | None = None,
+) -> int:
+    findings_list, packages_list, fixes_list = transform_scan_results(
+        results,
+        image_digest,
+        filesystem_snapshot_ids,
+    )
+
+    load_scan_vulns(neo4j_session, findings_list, update_tag=update_tag)
+    load_scan_packages(neo4j_session, packages_list, update_tag=update_tag)
+    load_scan_fixes(neo4j_session, fixes_list, update_tag=update_tag)
+
+    seen_ids = {pkg["id"] for pkg in packages_list}
+    all_packages = transform_all_packages(
+        results,
+        image_digest,
+        seen_ids,
+        filesystem_snapshot_ids,
+    )
+    if all_packages:
+        logger.info(
+            "Loading %d additional non-vulnerable packages for %s",
+            len(all_packages),
+            source,
+        )
+        load_scan_packages(neo4j_session, all_packages, update_tag=update_tag)
+
+    return len(findings_list)
+
+
+@timeit
+def get_json_files_in_s3(
+    s3_bucket: str, s3_prefix: str, boto3_session: boto3.Session
+) -> set[str]:
+    """
+    List S3 objects in the S3 prefix.
+
+    Args:
+        s3_bucket: S3 bucket name containing scan results
+        s3_prefix: S3 prefix path containing scan results
+        boto3_session: boto3 session for dependency injection
+
+    Returns:
+        Set of S3 object keys for JSON files in the S3 prefix
+    """
+    # DEPRECATED: get_json_files_in_s3() will be removed in v1.0.0.
+    try:
+        with S3BucketReader(
+            boto3_session,
+            s3_bucket,
+            s3_prefix,
+        ) as reader:
+            results = {
+                ref.name
+                for ref in filter_report_refs(
+                    reader.list_reports(),
+                    suffix=".json",
+                )
+            }
+
+    except Exception as e:
+        logger.error(
+            f"Error listing S3 objects in bucket {s3_bucket} with prefix {s3_prefix}: {e}"
+        )
+        raise
+
+    logger.info(f"Found {len(results)} json files in s3://{s3_bucket}/{s3_prefix}")
+    return results
+
+
+@timeit
+def get_json_files_in_dir(results_dir: str) -> set[str]:
+    """Return set of JSON file paths under a directory."""
+    results = set()
+    for root, _dirs, files in os.walk(results_dir):
+        for filename in files:
+            if filename.endswith(".json"):
+                results.add(os.path.join(root, filename))
+    logger.info(f"Found {len(results)} json files in {results_dir}")
+    return results
+
+
+@timeit
+def cleanup(neo4j_session: Session, common_job_parameters: dict[str, Any]) -> None:
+    """
+    Run cleanup jobs for Trivy nodes.
+    """
+    _migrate_legacy_package_labels(neo4j_session)
+
+    logger.info("Running Trivy cleanup")
+    GraphJob.from_node_schema(TrivyImageFindingSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+    GraphJob.from_node_schema(TrivyPackageSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+    GraphJob.from_node_schema(TrivyFixSchema(), common_job_parameters).run(
+        neo4j_session
+    )
+
+
+@timeit
+def cleanup_filesystem_snapshot_relationships(
+    neo4j_session: Session,
+    update_tag: int,
+    snapshot_ids: list[str] | None = None,
+) -> None:
+    """Remove stale filesystem edges, optionally limited to the given snapshots."""
+    run_write_query(
+        neo4j_session,
+        """
+        CALL {
+          MATCH (:TrivyImageFinding)-[r:AFFECTS]->(snapshot:FilesystemSnapshot)
+          WHERE (r.lastupdated IS NULL OR r.lastupdated <> $UPDATE_TAG)
+            AND ($snapshot_ids IS NULL OR snapshot.id IN $snapshot_ids)
+          DELETE r
+          RETURN count(*) AS removed_findings
+        }
+        CALL {
+          MATCH (:TrivyPackage)-[r:DEPLOYED]->(snapshot:FilesystemSnapshot)
+          WHERE (r.lastupdated IS NULL OR r.lastupdated <> $UPDATE_TAG)
+            AND ($snapshot_ids IS NULL OR snapshot.id IN $snapshot_ids)
+          DELETE r
+          RETURN count(*) AS removed_packages
+        }
+        RETURN removed_findings, removed_packages
+        """,
+        UPDATE_TAG=update_tag,
+        snapshot_ids=snapshot_ids,
+    )
+
+
+@timeit
+def cleanup_image_relationships(
+    neo4j_session: Session,
+    update_tag: int,
+) -> None:
+    """Remove stale image edges without touching filesystem-scoped scan data."""
+    run_write_query(
+        neo4j_session,
+        """
+        CALL {
+          MATCH (:TrivyImageFinding)-[r:AFFECTS]->(:Image)
+          WHERE r.lastupdated IS NULL OR r.lastupdated <> $UPDATE_TAG
+          DELETE r
+          RETURN count(*) AS removed_findings
+        }
+        CALL {
+          MATCH (:TrivyPackage)-[r:DEPLOYED]->(:Image)
+          WHERE r.lastupdated IS NULL OR r.lastupdated <> $UPDATE_TAG
+          DELETE r
+          RETURN count(*) AS removed_packages
+        }
+        RETURN removed_findings, removed_packages
+        """,
+        UPDATE_TAG=update_tag,
+    )
+
+
+# DEPRECATED: legacy Package label migration will be removed in v1.0.0.
+def _migrate_legacy_package_labels(neo4j_session: Session) -> None:
+    """One-time migration: relabel legacy Package → TrivyPackage for nodes created before the rename."""
+    # Package is reserved as the canonical ontology primary label.
+    # Non-ontology nodes should never use :Package going forward
+    # (enforced by tests/unit/cartography/intel/ontology/test_ontology_mapping.py).
+    check_query = """
+    MATCH (n:Package)
+    WHERE NOT n:Ontology
+    RETURN count(n) as legacy_count
+    """
+    result = neo4j_session.run(check_query)
+    legacy_count = result.single()["legacy_count"]
+
+    if legacy_count == 0:
+        return
+
+    logger.info("Migrating %d legacy Package nodes to TrivyPackage...", legacy_count)
+    migration_query = """
+    MATCH (n:Package)
+    WHERE NOT n:Ontology
+    SET n:TrivyPackage
+    REMOVE n:Package
+    RETURN count(n) as migrated
+    """
+    result = neo4j_session.run(migration_query)
+    logger.info(
+        "Migrated %d Package nodes to TrivyPackage",
+        result.single()["migrated"],
+    )
+
+
+@timeit
+def load_scan_vulns(
+    neo4j_session: Session,
+    findings_list: list[dict[str, Any]],
+    update_tag: int,
+) -> None:
+    """
+    Load TrivyImageFinding nodes into Neo4j.
+    """
+    load(
+        neo4j_session,
+        TrivyImageFindingSchema(),
+        findings_list,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_scan_packages(
+    neo4j_session: Session,
+    packages_list: list[dict[str, Any]],
+    update_tag: int,
+) -> None:
+    """
+    Load TrivyPackage nodes into Neo4j.
+    """
+    load(
+        neo4j_session,
+        TrivyPackageSchema(),
+        packages_list,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def load_scan_fixes(
+    neo4j_session: Session,
+    fixes_list: list[dict[str, Any]],
+    update_tag: int,
+) -> None:
+    """
+    Load TrivyFix nodes into Neo4j.
+    """
+    load(
+        neo4j_session,
+        TrivyFixSchema(),
+        fixes_list,
+        lastupdated=update_tag,
+    )
+
+
+@timeit
+def sync_single_image_from_s3(
+    neo4j_session: Session,
+    image_uri: str,
+    update_tag: int,
+    s3_bucket: str,
+    s3_object_key: str,
+    boto3_session: boto3.Session,
+) -> None:
+    """
+    Read Trivy scan results from S3 and sync to Neo4j.
+
+    Args:
+        neo4j_session: Neo4j session for database operations
+        image_uri: ECR image URI
+        update_tag: Update tag for tracking
+        s3_bucket: S3 bucket containing scan results
+        s3_object_key: S3 object key for this image's scan results
+        boto3_session: boto3 session for S3 operations
+    """
+    # DEPRECATED: sync_single_image_from_s3() will be removed in v1.0.0.
+    logger.debug(f"Reading scan results from S3: s3://{s3_bucket}/{s3_object_key}")
+    # Empty prefix is intentional: this compatibility wrapper reads exactly one
+    # caller-provided key through the shared reader API.
+    with S3BucketReader(boto3_session, s3_bucket, "") as reader:
+        scan_data_json = read_text_report(
+            reader,
+            ReportRef(uri=f"s3://{s3_bucket}/{s3_object_key}", name=s3_object_key),
+        )
+
+    trivy_data = json.loads(scan_data_json)
+    sync_single_image(neo4j_session, trivy_data, image_uri, update_tag)
+
+
+@timeit
+def sync_single_image_from_file(
+    neo4j_session: Session,
+    file_path: str,
+    update_tag: int,
+) -> None:
+    """Read a Trivy JSON file from disk and sync to Neo4j."""
+    logger.debug(f"Reading scan results from file: {file_path}")
+    with open(file_path, encoding="utf-8") as f:
+        trivy_data = json.load(f)
+
+    sync_single_image(neo4j_session, trivy_data, file_path, update_tag)

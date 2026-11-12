@@ -1,34 +1,182 @@
 import logging
+from typing import Iterator
 
+import boto3
 from neo4j import Session
 
+from cartography.analysis.kubernetes.analysis import K8S_AKS_LOAD_BALANCER
+from cartography.analysis.kubernetes.analysis import K8S_COMPUTE_ASSET_EXPOSURE_JOBS
+from cartography.analysis.kubernetes.analysis import K8S_GKE_JOBS
+from cartography.analysis.kubernetes.analysis import K8S_LB_EXPOSURE_JOBS
 from cartography.config import Config
+from cartography.intel.kubernetes import gke_auth
+from cartography.intel.kubernetes.clusters import sync_kubernetes_cluster
+from cartography.intel.kubernetes.eks import sync as sync_eks
+from cartography.intel.kubernetes.gateway_api import sync_gateway_api
+from cartography.intel.kubernetes.ingress import sync_ingress
 from cartography.intel.kubernetes.namespaces import sync_namespaces
+from cartography.intel.kubernetes.networkpolicies import sync_network_policies
+from cartography.intel.kubernetes.nodes import sync_nodes
 from cartography.intel.kubernetes.pods import sync_pods
+from cartography.intel.kubernetes.rbac import sync_kubernetes_rbac
+from cartography.intel.kubernetes.secrets import sync_secrets
 from cartography.intel.kubernetes.services import sync_services
+from cartography.intel.kubernetes.storage import sync_storage
+from cartography.intel.kubernetes.target_group_bindings import (
+    sync_target_group_bindings,
+)
 from cartography.intel.kubernetes.util import get_k8s_clients
-from cartography.util import run_cleanup_job
+from cartography.intel.kubernetes.util import K8sClient
+from cartography.intel.kubernetes.workloads import sync_workloads
+from cartography.util import run_typed_analysis_job
 from cartography.util import timeit
 
 logger = logging.getLogger(__name__)
 
 
+def get_region_from_arn(arn: str) -> str:
+    """
+    Extract AWS region from EKS cluster ARN.
+    Example: arn:aws:eks:us-east-1:111122223333:cluster/example-eks-cluster → us-east-1
+    """
+    parts = arn.split(":")
+    if len(parts) < 6 or parts[2] != "eks":
+        raise ValueError(f"Invalid EKS cluster ARN: {arn}")
+    return parts[3]
+
+
+def _get_clients(config: Config) -> Iterator[K8sClient]:
+    """
+    Yield kubeconfig clients, then clients for each `--gke-cluster`.
+
+    With `--managed-kubernetes gke`, kubeconfig still authenticates Kubernetes requests;
+    Google credentials are only used to read each cluster's GKE API metadata.
+    """
+    credentials = None
+    if config.gke_clusters or config.managed_kubernetes == "gke":
+        credentials = gke_auth.get_credentials(
+            config.gke_impersonate_service_account, config.gke_credentials
+        )
+
+    if config.k8s_kubeconfig:
+        for client in get_k8s_clients(config.k8s_kubeconfig):
+            if credentials is not None and config.managed_kubernetes == "gke":
+                client.gke_cluster = gke_auth.get_cluster(
+                    client.external_id or client.name, credentials
+                )
+            yield client
+
+    if credentials is None:
+        return
+    for resource in config.gke_clusters or []:
+        cluster = gke_auth.get_cluster(resource, credentials)
+        if cluster is None:
+            continue
+        with gke_auth.connect(cluster, credentials, config.gke_endpoint) as client:
+            yield client
+
+
 @timeit
 def start_k8s_ingestion(session: Session, config: Config) -> None:
-
-    common_job_parameters = {"UPDATE_TAG": config.update_tag}
-    if not config.k8s_kubeconfig:
-        logger.error("kubeconfig not found.")
+    if not config.update_tag:
+        logger.error("Cartography update tag not provided.")
         return
 
-    for client in get_k8s_clients(config.k8s_kubeconfig):
-        cluster = sync_namespaces(session, client, config.update_tag)
-        pods = sync_pods(session, client, config.update_tag, cluster)
-        sync_services(session, client, config.update_tag, cluster, pods)
+    if not config.k8s_kubeconfig and not config.gke_clusters:
+        logger.error("Kubernetes kubeconfig or --gke-cluster not provided.")
+        return
 
-    run_cleanup_job(
-        "kubernetes_import_cleanup.json",
-        session,
-        common_job_parameters,
-        package="cartography.data.jobs.cleanup",
-    )
+    common_job_parameters = {"UPDATE_TAG": config.update_tag}
+
+    for client in _get_clients(config):
+        logger.info(f"Syncing data for k8s cluster {client.name}...")
+        try:
+            cluster_info = sync_kubernetes_cluster(
+                session,
+                client,
+                config.update_tag,
+                common_job_parameters,
+            )
+            common_job_parameters["CLUSTER_ID"] = cluster_info.get("id")
+            cluster_external_ref = cluster_info.get("external_id") or cluster_info.get(
+                "name", ""
+            )
+
+            sync_namespaces(session, client, config.update_tag, common_job_parameters)
+            node_arch_map = sync_nodes(
+                session, client, config.update_tag, common_job_parameters
+            )
+            sync_kubernetes_rbac(
+                session, client, config.update_tag, common_job_parameters
+            )
+            # Sync workload controllers before pods so the pod sync can collapse
+            # Pod -> ReplicaSet -> Deployment using the returned RS->Deployment map.
+            replicaset_owner_map = sync_workloads(
+                session, client, config.update_tag, common_job_parameters
+            )
+            sync_storage(session, client, config.update_tag, common_job_parameters)
+
+            # Extract region from cluster ARN (works for EKS; None for non-EKS clusters)
+            region: str | None = None
+            if config.managed_kubernetes == "eks":
+                # EKS clusters always have a valid ARN — let ValueError propagate if not
+                region = get_region_from_arn(cluster_external_ref)
+                boto3_session = boto3.Session()
+                sync_eks(
+                    session,
+                    client,
+                    boto3_session,
+                    region,
+                    config.update_tag,
+                    cluster_info.get("id", ""),
+                    cluster_external_ref,
+                )
+            else:
+                try:
+                    region = get_region_from_arn(cluster_external_ref)
+                except ValueError:
+                    pass
+            all_pods = sync_pods(
+                session,
+                client,
+                config.update_tag,
+                common_job_parameters,
+                region=region,
+                node_arch_map=node_arch_map,
+                replicaset_owner_map=replicaset_owner_map,
+            )
+            sync_secrets(session, client, config.update_tag, common_job_parameters)
+            sync_services(
+                session,
+                client,
+                all_pods,
+                config.update_tag,
+                common_job_parameters,
+            )
+            sync_network_policies(
+                session,
+                client,
+                all_pods,
+                config.update_tag,
+                common_job_parameters,
+            )
+            sync_gateway_api(session, client, config.update_tag, common_job_parameters)
+            sync_ingress(session, client, config.update_tag, common_job_parameters)
+            sync_target_group_bindings(
+                session, client, config.update_tag, common_job_parameters
+            )
+
+            # Runs for every cluster so generated cleanup also clears stale edges.
+            for job in K8S_GKE_JOBS:
+                run_typed_analysis_job(job, session, common_job_parameters)
+            run_typed_analysis_job(
+                K8S_AKS_LOAD_BALANCER, session, common_job_parameters
+            )
+
+            for job in K8S_COMPUTE_ASSET_EXPOSURE_JOBS:
+                run_typed_analysis_job(job, session, common_job_parameters)
+            for job in K8S_LB_EXPOSURE_JOBS:
+                run_typed_analysis_job(job, session, common_job_parameters)
+        except Exception:
+            logger.exception(f"Failed to sync data for k8s cluster {client.name}...")
+            raise

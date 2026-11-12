@@ -1,0 +1,177 @@
+import json
+import logging
+import re
+from typing import Any
+
+import neo4j
+from kubernetes.client.exceptions import ApiException
+from kubernetes.client.models import V1Node
+
+from cartography.client.core.tx import load
+from cartography.graph.job import GraphJob
+from cartography.intel.container_arch import normalize_architecture
+from cartography.intel.gcp.gke_utils import instance_id_from_provider_id
+from cartography.intel.kubernetes.util import format_resource_quantities
+from cartography.intel.kubernetes.util import get_gke_cluster_ref
+from cartography.intel.kubernetes.util import get_gpu_quantity
+from cartography.intel.kubernetes.util import k8s_paginate
+from cartography.intel.kubernetes.util import K8sClient
+from cartography.models.kubernetes.nodes import KubernetesNodeSchema
+from cartography.util import timeit
+
+logger = logging.getLogger(__name__)
+
+
+@timeit
+def get_nodes(client: K8sClient) -> list[V1Node]:
+    return k8s_paginate(client.core.list_node, raise_on_error=True)
+
+
+def _ec2_instance_id_from_provider_id(provider_id: str | None) -> str | None:
+    """Extract the EC2 instance id from an EKS node's providerID.
+
+    EKS sets ``spec.providerID`` to ``aws:///<availability-zone>/<instance-id>``.
+    Other providers (GCE, Azure) use different formats and return None.
+    """
+    if not provider_id or not provider_id.startswith("aws://"):
+        return None
+    instance_id = provider_id.rsplit("/", 1)[-1]
+    return instance_id if instance_id.startswith("i-") else None
+
+
+# AKS sets `spec.providerID` to
+# `azure:///subscriptions/<sub>/resourceGroups/<node resource group>/providers/...`.
+_AZURE_PROVIDER_ID = re.compile(
+    r"^azure:///subscriptions/([^/]+)/resourceGroups/([^/]+)/", re.IGNORECASE
+)
+
+
+def _azure_scope_from_provider_id(
+    provider_id: str | None,
+) -> tuple[str | None, str | None]:
+    match = _AZURE_PROVIDER_ID.match(provider_id or "")
+    if not match:
+        return None, None
+    return match.group(1).lower(), match.group(2).lower()
+
+
+def transform_nodes(
+    nodes: list[V1Node],
+    cluster_name: str,
+    gke_resource_name: str | None = None,
+) -> list[dict[str, Any]]:
+    transformed = []
+    for node in nodes:
+        ni = node.status.node_info if node.status else None
+        provider_id = getattr(getattr(node, "spec", None), "provider_id", None)
+        labels = node.metadata.labels or {}
+        capacity = node.status.capacity if node.status else None
+        allocatable = node.status.allocatable if node.status else None
+        gke_node_pool = labels.get("cloud.google.com/gke-nodepool")
+        azure_subscription_id, azure_resource_group = _azure_scope_from_provider_id(
+            provider_id
+        )
+        transformed.append(
+            {
+                "id": f"{cluster_name}/{node.metadata.name}",
+                "name": node.metadata.name,
+                "provider_id": provider_id,
+                "instance_id": _ec2_instance_id_from_provider_id(provider_id),
+                "gcp_instance_id": instance_id_from_provider_id(provider_id),
+                "azure_subscription_id": azure_subscription_id,
+                "azure_resource_group": azure_resource_group,
+                "gke_node_pool": gke_node_pool,
+                "gke_node_pool_id": (
+                    f"{gke_resource_name}/nodePools/{gke_node_pool}"
+                    if gke_resource_name and gke_node_pool
+                    else None
+                ),
+                "labels": json.dumps(labels, sort_keys=True),
+                "capacity": format_resource_quantities(capacity),
+                "allocatable": format_resource_quantities(allocatable),
+                "gpu_capacity": get_gpu_quantity(capacity),
+                "gpu_allocatable": get_gpu_quantity(allocatable),
+                "gpu_product": labels.get("nvidia.com/gpu.product")
+                or labels.get("cloud.google.com/gke-accelerator"),
+                "architecture": getattr(ni, "architecture", None),
+                "architecture_normalized": normalize_architecture(
+                    getattr(ni, "architecture", None),
+                ),
+                "os": getattr(ni, "operating_system", None),
+                "os_image": getattr(ni, "os_image", None),
+                "kernel_version": getattr(ni, "kernel_version", None),
+                "container_runtime_version": getattr(
+                    ni,
+                    "container_runtime_version",
+                    None,
+                ),
+                "kubelet_version": getattr(ni, "kubelet_version", None),
+            }
+        )
+    return transformed
+
+
+def load_nodes(
+    session: neo4j.Session,
+    nodes: list[dict[str, Any]],
+    update_tag: int,
+    cluster_id: str,
+    cluster_name: str,
+) -> None:
+    load(
+        session,
+        KubernetesNodeSchema(),
+        nodes,
+        lastupdated=update_tag,
+        CLUSTER_ID=cluster_id,
+        CLUSTER_NAME=cluster_name,
+    )
+
+
+def cleanup(session: neo4j.Session, common_job_parameters: dict[str, Any]) -> None:
+    logger.debug("Running cleanup job for KubernetesNode")
+    GraphJob.from_node_schema(KubernetesNodeSchema(), common_job_parameters).run(
+        session
+    )
+
+
+@timeit
+def sync_nodes(
+    session: neo4j.Session,
+    client: K8sClient,
+    update_tag: int,
+    common_job_parameters: dict[str, Any],
+) -> dict[str, str]:
+    try:
+        raw_nodes = get_nodes(client)
+    except ApiException as err:
+        if err.status in (401, 403):
+            # A partial nodes snapshot cannot be told apart from an empty one, so skip
+            # load + cleanup and keep the previous data, like `sync_secrets`.
+            logger.warning(
+                "Cartography lacks permission to list nodes on cluster %s (status %s). "
+                "Skipping nodes sync and preserving previously synced data.",
+                client.name,
+                err.status,
+            )
+            return {}
+        raise
+    gke_ref = get_gke_cluster_ref(client)
+    transformed = transform_nodes(
+        raw_nodes, client.name, gke_ref.resource_name if gke_ref else None
+    )
+    load_nodes(
+        session,
+        transformed,
+        update_tag,
+        common_job_parameters["CLUSTER_ID"],
+        client.name,
+    )
+    cleanup(session, common_job_parameters)
+    # Return a node-name → architecture_normalized lookup so callers can stamp
+    # the runtime arch onto pods and containers without a graph traversal.
+    return {
+        n["name"]: n["architecture_normalized"]
+        for n in transformed
+        if n.get("architecture_normalized")
+    }

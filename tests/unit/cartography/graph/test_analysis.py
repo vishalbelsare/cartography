@@ -1,0 +1,740 @@
+import json
+import pkgutil
+import re
+from collections import defaultdict
+from dataclasses import asdict
+from pathlib import Path
+from types import ModuleType
+from typing import Iterator
+
+import pytest
+
+import cartography.analysis
+from cartography.graph.analysis import AddRelationship
+from cartography.graph.analysis import AddToSet
+from cartography.graph.analysis import AddValuesToSet
+from cartography.graph.analysis import AnalysisJob
+from cartography.graph.analysis import AnalysisStatement
+from cartography.graph.analysis import Case
+from cartography.graph.analysis import IncrementalMatch
+from cartography.graph.analysis import Param
+from cartography.graph.analysis import PropertyEffect
+from cartography.graph.analysis import RawCypher
+from cartography.graph.analysis import RelationshipEffect
+from cartography.graph.analysis import RelationshipPropertyEffect
+from cartography.graph.analysis import ScopeById
+from cartography.graph.analysis import SetProperties
+from cartography.graph.analysis import SetProperty
+from cartography.graph.analysis import SetRelationshipProperty
+from cartography.graph.analysis import SetRelationshipPropertyIfMissing
+from cartography.graph.analysisbuilder import compile_query
+from cartography.graph.analysisbuilder import properties_set
+from cartography.graph.analysisbuilder import relationships_added
+from cartography.graph.analysisbuilder import to_graph_job
+from cartography.graph.job import GraphJob
+from cartography.models.core.nodes import CartographyNodeSchema
+from cartography.models.introspection import iter_model_classes
+from tests.unit.cartography.graph.helpers import clean_query_list
+
+MUTATING_CYPHER_RE = re.compile(
+    r"\b(CREATE|DELETE|DETACH|MERGE|REMOVE|SET)\b",
+    re.IGNORECASE,
+)
+
+
+def _analysis_modules() -> Iterator[ModuleType]:
+    for module_info in pkgutil.walk_packages(
+        cartography.analysis.__path__,
+        prefix=f"{cartography.analysis.__name__}.",
+    ):
+        if module_info.ispkg:
+            continue
+        module = __import__(module_info.name, fromlist=["_"])
+        yield module
+
+
+def _analysis_jobs() -> Iterator[AnalysisJob]:
+    seen: set[int] = set()
+    for module in _analysis_modules():
+        for value in vars(module).values():
+            jobs: tuple[AnalysisJob, ...]
+            if isinstance(value, AnalysisJob):
+                jobs = (value,)
+            elif isinstance(value, tuple) and all(
+                isinstance(item, AnalysisJob) for item in value
+            ):
+                jobs = value
+            else:
+                continue
+
+            for job in jobs:
+                if id(job) in seen:
+                    continue
+                seen.add(id(job))
+                yield job
+
+
+def test_typed_analysis_jobs_declare_effects_and_keep_match_queries_read_only():
+    for job in _analysis_jobs():
+        for index, statement in enumerate(job.statements):
+            assert statement.query is None, (
+                f"{job.short_name or job.name} statement {index} uses raw query; "
+                "write/cleanup-only analysis must stay as JSON."
+            )
+            assert (
+                statement.effects
+            ), f"{job.short_name or job.name} statement {index} has no effects."
+            assert statement.match is not None
+            assert not MUTATING_CYPHER_RE.search(statement.match), (
+                f"{job.short_name or job.name} statement {index} has a mutating "
+                "match query; mutations must be declared as effects."
+            )
+            assert "$UPDATE_TAG" not in statement.match, (
+                f"{job.short_name or job.name} statement {index} inlines its "
+                "freshness filter; use incremental_on."
+            )
+            if job.scope:
+                assert job.scope.scope_on
+                assert f"${job.scope.id_param}" not in statement.match, (
+                    f"{job.short_name or job.name} statement {index} inlines "
+                    "its declared scope."
+                )
+
+
+def test_typed_analysis_jobs_do_not_declare_conflicting_cleanup_guards():
+    """
+    Cleanup effects dedupe by value, so two statements that add the same edge with
+    different cleanup_where values emit two cleanup statements, and the least
+    restrictive one wins. That silently re-widens a guard meant to protect
+    provider-owned edges, so the guard has to be consistent across the job.
+    """
+    for job in _analysis_jobs():
+        guards_by_edge: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+        for effect in relationships_added(job):
+            edge = (effect.source_label, effect.rel_label, effect.target_label)
+            guards_by_edge[edge].add(effect.cleanup_where)
+
+        for edge, guards in guards_by_edge.items():
+            assert len(guards) == 1, (
+                f"{job.short_name or job.name} declares {edge} with conflicting "
+                f"cleanup_where values {sorted(guards)}; the job emits one cleanup "
+                "per distinct value and the least restrictive one deletes the edges "
+                "the others were written to keep."
+            )
+
+
+# Properties that both ingestion and an analysis job write on purpose.
+INGESTED_AND_ANALYZED_PROPERTIES = {
+    ("AWSAccount", "foreign"),
+    ("AWSS3Bucket", "anonymous_access"),
+    ("AWSS3Bucket", "anonymous_actions"),
+}
+
+
+def test_node_schemas_mark_analysis_owned_properties():
+    """
+    A data-fed PropertyRef makes every load() write the property back to null when the
+    transform does not supply it, so an analysis-owned value disappears until the job
+    runs again. Analysis-owned properties must be declared with set_by_analysis=True.
+    """
+    analysis_owned: set[tuple[str, str]] = set()
+    for job in _analysis_jobs():
+        for effect in properties_set(job):
+            if isinstance(effect, PropertyEffect):
+                analysis_owned.update(
+                    (effect.node_label, prop) for prop in effect.properties
+                )
+
+    for model_class in iter_model_classes():
+        if not issubclass(model_class, CartographyNodeSchema):
+            continue
+        schema = model_class()
+        for name, prop_ref in asdict(schema.properties).items():
+            key = (schema.label, name)
+            if prop_ref.set_by_analysis:
+                assert key in analysis_owned, (
+                    f"{model_class.__name__}.{name} is set_by_analysis but no "
+                    "typed analysis job sets it."
+                )
+            elif key in analysis_owned and key not in INGESTED_AND_ANALYZED_PROPERTIES:
+                raise AssertionError(
+                    f"{model_class.__name__}.{name} is set by an analysis job; declare it "
+                    "with set_by_analysis=True so load() does not reset it.",
+                )
+
+
+def test_relationship_job_appends_cleanup_statement():
+    # Arrange
+    job = AnalysisJob(
+        name="Lambda functions with ECR images",
+        short_name="aws_lambda_ecr",
+        statements=(
+            AnalysisStatement(
+                match=(
+                    "MATCH (l:AWSLambda), (e:AWSECRImage) "
+                    "WHERE e.digest = 'sha256:' + l.codesha256"
+                ),
+                effects=(
+                    AddRelationship(
+                        "l",
+                        "HAS",
+                        "e",
+                        source_label="AWSLambda",
+                        target_label="AWSECRImage",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    # Act
+    graph_job = to_graph_job(job)
+
+    # Assert
+    assert relationships_added(job) == (
+        RelationshipEffect("AWSLambda", "HAS", "AWSECRImage"),
+    )
+    assert properties_set(job) == ()
+    assert len(graph_job.statements) == 2
+    assert graph_job.statements[1].query == (
+        "MATCH (source:AWSLambda)-[r:HAS]->(target:AWSECRImage)\n"
+        "WHERE r.lastupdated <> $UPDATE_TAG\n"
+        "WITH r LIMIT $LIMIT_SIZE\n"
+        "DELETE r"
+    )
+    assert graph_job.statements[1].iterative is True
+    assert graph_job.statements[1].parameters["LIMIT_SIZE"] == 10000
+
+
+def test_relationship_cleanup_can_keep_provider_owned_edges():
+    job = AnalysisJob(
+        name="DNS records to EC2 instances",
+        statements=(
+            AnalysisStatement(
+                match="MATCH (dns:DNSRecord), (i:AWSEC2Instance)",
+                effects=(
+                    AddRelationship(
+                        "dns",
+                        "DNS_POINTS_TO",
+                        "i",
+                        source_label="DNSRecord",
+                        target_label="AWSEC2Instance",
+                        cleanup_where="NOT source:AWSDNSRecord",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    graph_job = to_graph_job(job)
+
+    assert graph_job.statements[1].query == (
+        "MATCH (source:DNSRecord)-[r:DNS_POINTS_TO]->(target:AWSEC2Instance)\n"
+        "WHERE r.lastupdated <> $UPDATE_TAG AND (NOT source:AWSDNSRecord)\n"
+        "WITH r LIMIT $LIMIT_SIZE\n"
+        "DELETE r"
+    )
+
+
+def test_statement_compiles_add_relationship_effect():
+    # Arrange
+    statement = AnalysisStatement(
+        match=(
+            "MATCH (l:AWSLambda)\n"
+            "MATCH (e:AWSECRImage)\n"
+            "WHERE e.digest = 'sha256:' + l.codesha256"
+        ),
+        effects=(
+            AddRelationship(
+                "l",
+                "HAS",
+                "e",
+                source_label="AWSLambda",
+                target_label="AWSECRImage",
+            ),
+        ),
+    )
+
+    # Act and assert
+    assert clean_query_list([compile_query(statement)]) == clean_query_list(
+        [
+            """
+            MATCH (l:AWSLambda)
+            MATCH (e:AWSECRImage)
+            WHERE e.digest = 'sha256:' + l.codesha256
+            MERGE (l)-[r:HAS]->(e)
+            ON CREATE SET r.firstseen = timestamp()
+            SET r.lastupdated = $UPDATE_TAG
+            """
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("match", "gated_match"),
+    [
+        (
+            "MATCH (:Agent)<-[obs:OBSERVED_AS]-(d:Device)",
+            "MATCH (:Agent)<-[obs:OBSERVED_AS {lastupdated: $UPDATE_TAG}]-"
+            "(d:Device {lastupdated: $UPDATE_TAG})",
+        ),
+        (
+            "MATCH (:Agent)<-[obs:OBSERVED_AS{source:'edr'}]-(d:Device {kind:'laptop'})",
+            "MATCH (:Agent)<-[obs:OBSERVED_AS {lastupdated: $UPDATE_TAG, source:'edr'}]-"
+            "(d:Device {lastupdated: $UPDATE_TAG, kind:'laptop'})",
+        ),
+        (
+            "MATCH (a:Agent) WHERE EXISTS { MATCH (a)<-[obs:OBSERVED_AS]-(d:Device) } "
+            "MATCH (a)<-[obs:OBSERVED_AS]-(d:Device)",
+            "MATCH (a:Agent) WHERE EXISTS { MATCH (a)<-[obs:OBSERVED_AS]-(d:Device) } "
+            "MATCH (a)<-[obs:OBSERVED_AS {lastupdated: $UPDATE_TAG}]-"
+            "(d:Device {lastupdated: $UPDATE_TAG})",
+        ),
+    ],
+    ids=["bare", "existing_properties", "after_subquery"],
+)
+def test_statement_gates_incremental_variables_in_their_match_pattern(
+    match,
+    gated_match,
+):
+    # Arrange
+    statement = AnalysisStatement(
+        match=match,
+        effects=(SetProperty("d", "linked", True, label="Device"),),
+        incremental_on=("d", IncrementalMatch("obs", relationship=True)),
+    )
+
+    # Act
+    query = compile_query(statement)
+
+    # Assert
+    assert query.splitlines()[0] == gated_match
+
+
+@pytest.mark.parametrize(
+    "match",
+    [
+        "MATCH (d:Device) WITH d, d.agent AS agent",
+        "MATCH (d:Device) WITH d, d.agent AS agent WHERE (agent) IS NOT NULL",
+        "MATCH (d:Device) OPTIONAL MATCH (d)-[:OBSERVED_AS]->(agent:Agent)",
+        "MATCH (d:Device) WHERE EXISTS { MATCH (d)-[:OBSERVED_AS]->(agent:Agent) }",
+        "MATCH (d:Device) // }\nOPTIONAL MATCH (d)-[:OBSERVED_AS]->(agent:Agent)",
+    ],
+    ids=[
+        "projection",
+        "parenthesized_expression",
+        "optional_match",
+        "subquery",
+        "optional_match_after_comment",
+    ],
+)
+def test_statement_rejects_incremental_variable_outside_a_required_pattern(match):
+    # Arrange
+    statement = AnalysisStatement(
+        match=match,
+        effects=(SetProperty("d", "linked", True, label="Device"),),
+        incremental_on=IncrementalMatch("agent"),
+    )
+
+    # Act and assert
+    with pytest.raises(ValueError, match="'agent'"):
+        compile_query(statement)
+
+
+def test_matching_fingerprint_uses_update_tag_firstseen():
+    # Arrange
+    from cartography.analysis.aws.analysis import AWS_EC2_KEYPAIR_MATCHING_FINGERPRINT
+
+    statement = AWS_EC2_KEYPAIR_MATCHING_FINGERPRINT.statements[0]
+
+    # Act and assert
+    assert "ON CREATE SET r.firstseen = $UPDATE_TAG" in compile_query(statement)
+
+
+def test_statement_compiles_property_effects():
+    # Arrange
+    statement = AnalysisStatement(
+        match="MATCH (instance:AWSEC2Instance) WHERE instance.publicipaddress IS NOT NULL",
+        effects=(
+            AddToSet(
+                "instance",
+                "exposed_internet_type",
+                "direct",
+                label="AWSEC2Instance",
+            ),
+            SetProperty("instance", "exposed_internet", True, label="AWSEC2Instance"),
+        ),
+    )
+
+    # Act and assert
+    assert compile_query(statement) == (
+        "MATCH (instance:AWSEC2Instance) WHERE instance.publicipaddress IS NOT NULL\n"
+        "SET instance.exposed_internet_type = "
+        "CASE WHEN instance.exposed_internet_type IS NULL THEN ['direct'] "
+        "WHEN NOT 'direct' IN instance.exposed_internet_type "
+        "THEN instance.exposed_internet_type + ['direct'] "
+        "ELSE instance.exposed_internet_type END\n"
+        "SET instance.exposed_internet = true"
+    )
+
+
+def test_statement_compiles_multiple_values_to_set():
+    statement = AnalysisStatement(
+        match="MATCH (bucket:AWSS3Bucket)",
+        effects=(
+            AddValuesToSet(
+                "bucket",
+                "anonymous_actions",
+                ("s3:ListBucket", "s3:GetBucketAcl"),
+                label="AWSS3Bucket",
+            ),
+        ),
+    )
+
+    assert compile_query(statement) == (
+        "MATCH (bucket:AWSS3Bucket)\n"
+        "SET bucket.anonymous_actions = "
+        "CASE WHEN bucket.anonymous_actions IS NULL THEN ['s3:ListBucket'] "
+        "WHEN NOT 's3:ListBucket' IN bucket.anonymous_actions "
+        "THEN bucket.anonymous_actions + ['s3:ListBucket'] "
+        "ELSE bucket.anonymous_actions END\n"
+        "SET bucket.anonymous_actions = "
+        "CASE WHEN bucket.anonymous_actions IS NULL THEN ['s3:GetBucketAcl'] "
+        "WHEN NOT 's3:GetBucketAcl' IN bucket.anonymous_actions "
+        "THEN bucket.anonymous_actions + ['s3:GetBucketAcl'] "
+        "ELSE bucket.anonymous_actions END"
+    )
+
+
+def test_statement_compiles_case_expression():
+    statement = AnalysisStatement(
+        match="MATCH (bucket:GCPBucket)",
+        effects=(
+            SetProperty(
+                "bucket",
+                "_ont_public",
+                Case(
+                    when=(("bucket.disabled = true", False),),
+                    else_=RawCypher("coalesce(bucket.public, false)"),
+                ),
+                label="GCPBucket",
+            ),
+        ),
+    )
+
+    assert compile_query(statement) == (
+        "MATCH (bucket:GCPBucket)\n"
+        "SET bucket._ont_public = CASE WHEN bucket.disabled = true THEN false "
+        "ELSE coalesce(bucket.public, false) END"
+    )
+
+
+def test_statement_rejects_property_effect_without_label():
+    # Arrange
+    statement = AnalysisStatement(
+        match="MATCH (n:Node)",
+        effects=(SetProperty("n", "flag", True),),
+    )
+
+    # Act and assert
+    with pytest.raises(ValueError, match="Property effects require label"):
+        compile_query(statement)
+
+
+def test_statement_rejects_mixed_raw_and_compiled_query():
+    # Act and assert
+    with pytest.raises(ValueError, match="query or match/effects"):
+        AnalysisStatement(
+            "MATCH (n) RETURN n",
+            match="MATCH (n)",
+            effects=(SetProperty("n", "flag", True),),
+        )
+
+
+def test_scoped_relationship_cleanup_targets_source_by_default():
+    # Arrange
+    job = AnalysisJob(
+        name="GCP LB exposure",
+        short_name="gcp_lb_exposure",
+        scope=ScopeById("GCPProject", "PROJECT_ID", scope_on="bs"),
+        statements=(
+            AnalysisStatement(
+                match="MATCH (bs:GCPBackendService)-[:ROUTES_TO]->(:GCPInstanceGroup)"
+                "-[:HAS_MEMBER]->(i:GCPInstance)",
+                effects=(
+                    AddRelationship(
+                        "bs",
+                        "EXPOSE",
+                        "i",
+                        source_label="GCPBackendService",
+                        target_label="GCPInstance",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    # Act
+    graph_job = to_graph_job(job)
+
+    # Assert
+    assert graph_job.statements[1].query == (
+        "MATCH (scope:GCPProject {id: $PROJECT_ID})-[:RESOURCE]->(source)\n"
+        "MATCH (source:GCPBackendService)-[r:EXPOSE]->(target:GCPInstance)\n"
+        "WHERE r.lastupdated <> $UPDATE_TAG\n"
+        "WITH r LIMIT $LIMIT_SIZE\n"
+        "DELETE r"
+    )
+    assert graph_job.statements[0].query.startswith(
+        "MATCH (scope:GCPProject {id: $PROJECT_ID})-[:RESOURCE]->(bs)\n"
+        "MATCH (bs:GCPBackendService)"
+    )
+
+
+def test_relationship_job_allows_multiple_statements_for_one_effect():
+    # Arrange
+    job = AnalysisJob(
+        name="Resolved image analysis",
+        short_name="resolved_image_analysis",
+        statements=(
+            AnalysisStatement(
+                match="MATCH (c:Container)-[:HAS_IMAGE]->(i:Image)",
+                effects=(
+                    AddRelationship(
+                        "c",
+                        "RESOLVED_IMAGE",
+                        "i",
+                        source_label="Container",
+                        target_label="Image",
+                    ),
+                ),
+            ),
+            AnalysisStatement(
+                match="MATCH (c:Container)-[:HAS_IMAGE]->(:ImageManifestList)"
+                "-[:CONTAINS_IMAGE]->(i:Image)",
+                effects=(
+                    AddRelationship(
+                        "c",
+                        "RESOLVED_IMAGE",
+                        "i",
+                        source_label="Container",
+                        target_label="Image",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    # Act
+    graph_job = to_graph_job(job)
+
+    # Assert
+    assert len(graph_job.statements) == 3
+    assert graph_job.statements[2].query.startswith(
+        "MATCH (source:Container)-[r:RESOLVED_IMAGE]->(target:Image)",
+    )
+
+
+def test_property_job_prepends_cleanup_statement():
+    # Arrange
+    job = AnalysisJob(
+        name="Semgrep SAST risk analysis",
+        short_name="semgrep_sast_risk_analysis",
+        scope=ScopeById("SemgrepDeployment", "DEPLOYMENT_ID", scope_on="s"),
+        statements=(
+            AnalysisStatement(
+                match="MATCH (g:GitHubRepository{archived:true})"
+                "<-[:FOUND_IN]-(s:SemgrepSASTFinding)",
+                effects=(
+                    SetProperty(
+                        "s",
+                        "risk_severity",
+                        "INFO",
+                        label="SemgrepSASTFinding",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    # Act
+    graph_job = to_graph_job(job)
+
+    # Assert
+    assert relationships_added(job) == ()
+    assert properties_set(job) == (
+        PropertyEffect("SemgrepSASTFinding", ("risk_severity",)),
+    )
+    assert graph_job.statements[0].query == (
+        "MATCH (scope:SemgrepDeployment {id: $DEPLOYMENT_ID})"
+        "-[:RESOURCE]->(node:SemgrepSASTFinding)\n"
+        "WHERE node.risk_severity IS NOT NULL\n"
+        "WITH node LIMIT $LIMIT_SIZE\n"
+        "REMOVE node.risk_severity"
+    )
+    assert graph_job.statements[1].query.startswith(
+        "MATCH (scope:SemgrepDeployment {id: $DEPLOYMENT_ID})"
+        "-[:RESOURCE]->(s)\n"
+        "MATCH (g:GitHubRepository"
+    )
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        {"private": True},
+        {"private": True, "checked_at": 123},
+        {"private": True, "checked_at": Param("OTHER_TAG")},
+    ],
+    ids=["missing", "literal", "other_parameter"],
+)
+def test_set_properties_cleanup_stamp_must_hold_the_update_tag(properties):
+    # Act and assert
+    with pytest.raises(ValueError, match="cleanup_stamp"):
+        SetProperties("n", properties, label="Node", cleanup_stamp="checked_at")
+
+
+@pytest.mark.parametrize(
+    "cleanup,error",
+    [
+        # Cleanup after the statements would clear what they just wrote.
+        ({"cleanup_before_statements": False}, "requires a cleanup_stamp"),
+        (
+            {"cleanup_before_statements": False, "cleanup_stamp": "checked_at"},
+            "one of its properties",
+        ),
+        # A stamp only tells a trailing cleanup which values are current.
+        ({"cleanup_stamp": "flag"}, "after the statements"),
+    ],
+    ids=["after_without_stamp", "stamp_not_a_property", "stamp_before"],
+)
+def test_property_effect_rejects_inconsistent_cleanup_stamp(cleanup, error):
+    # Act and assert
+    with pytest.raises(ValueError, match=error):
+        PropertyEffect("Node", ("flag",), **cleanup)
+
+
+def test_property_effect_requires_properties():
+    # Act and assert
+    with pytest.raises(ValueError, match="at least one property"):
+        PropertyEffect("AWSEC2KeyPair", ())
+
+
+def test_relationship_property_job_prepends_cleanup_statement():
+    # Arrange
+    job = AnalysisJob(
+        name="Supply chain source file",
+        short_name="supply_chain_source_file",
+        statements=(
+            AnalysisStatement(
+                match="MATCH (i:Image)-[r:PACKAGED_FROM]->(:GitHubRepository) "
+                "WHERE r.dockerfile_path IS NULL",
+                effects=(
+                    SetRelationshipProperty(
+                        "r",
+                        "dockerfile_path",
+                        "i.source_file",
+                        source_label="Image",
+                        rel_label="PACKAGED_FROM",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    # Act
+    graph_job = to_graph_job(job)
+
+    # Assert
+    assert properties_set(job) == (
+        RelationshipPropertyEffect("Image", "PACKAGED_FROM", ("dockerfile_path",)),
+    )
+    assert graph_job.statements[0].query == (
+        "MATCH (source:Image)-[r:PACKAGED_FROM]->(target)\n"
+        "WHERE r.dockerfile_path IS NOT NULL\n"
+        "WITH r LIMIT $LIMIT_SIZE\n"
+        "REMOVE r.dockerfile_path"
+    )
+
+
+def test_relationship_property_effect_requires_properties():
+    # Act and assert
+    with pytest.raises(ValueError, match="at least one property"):
+        RelationshipPropertyEffect("Image", "PACKAGED_FROM", ())
+
+
+def test_relationship_property_if_missing_does_not_claim_cleanup_ownership():
+    # Arrange
+    from cartography.analysis.ontology.analysis import SUPPLY_CHAIN_SOURCE_FILE
+
+    # Act
+    graph_job = to_graph_job(SUPPLY_CHAIN_SOURCE_FILE)
+
+    # Assert
+    assert properties_set(SUPPLY_CHAIN_SOURCE_FILE) == ()
+    assert len(graph_job.statements) == 1
+    assert graph_job.statements[0].query == (
+        "MATCH (i:Image)-[r:PACKAGED_FROM]->() "
+        "WHERE r.dockerfile_path IS NULL AND i.source_file IS NOT NULL\n"
+        "SET r.dockerfile_path = i.source_file"
+    )
+    assert "REMOVE r.dockerfile_path" not in graph_job.statements[0].query
+
+
+def test_statement_compiles_relationship_property_if_missing_effect():
+    statement = AnalysisStatement(
+        match="MATCH (i:Image)-[r:PACKAGED_FROM]->() WHERE r.dockerfile_path IS NULL",
+        effects=(
+            SetRelationshipPropertyIfMissing(
+                "r",
+                "dockerfile_path",
+                RawCypher("i.source_file"),
+            ),
+        ),
+    )
+
+    assert compile_query(statement) == (
+        "MATCH (i:Image)-[r:PACKAGED_FROM]->() WHERE r.dockerfile_path IS NULL\n"
+        "SET r.dockerfile_path = i.source_file"
+    )
+
+
+def test_analysis_job_requires_statements():
+    # Act and assert
+    with pytest.raises(ValueError, match="at least one statement"):
+        AnalysisJob(
+            name="empty",
+            statements=(),
+        )
+
+
+def test_scope_by_id_requires_one_anchor_per_statement():
+    statement = AnalysisStatement(
+        match="MATCH (n:Node)",
+        effects=(SetProperty("n", "flag", True, label="Node"),),
+    )
+
+    with pytest.raises(ValueError, match="one variable per statement"):
+        AnalysisJob(
+            name="invalid scope",
+            statements=(statement, statement),
+            scope=ScopeById("Tenant", "TENANT_ID", scope_on=("n",)),
+        )
+
+
+@pytest.mark.parametrize(
+    "job_file",
+    sorted(Path("cartography/data/jobs/analysis").glob("*.json"))
+    + sorted(Path("cartography/data/jobs/scoped_analysis").glob("*.json")),
+    ids=lambda path: path.name,
+)
+def test_existing_analysis_json_jobs_still_deserialize(job_file):
+    # Arrange
+    data = json.loads(job_file.read_text())
+
+    # Act
+    job = GraphJob.from_json(data, job_file.stem)
+
+    # Assert
+    assert job.name == data["name"]
+    assert len(job.statements) == len(data["statements"])

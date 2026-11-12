@@ -1,0 +1,150 @@
+from cartography.models.ontology.mapping.specs import OntologyFieldMapping
+from cartography.models.ontology.mapping.specs import OntologyMapping
+from cartography.models.ontology.mapping.specs import OntologyNodeMapping
+
+# Image ontology fields:
+# - id: Unique identifier (digest for most registries)
+# - digest: SHA256 digest of the image
+# - uri: Full URI to pull the image
+# - architecture: CPU architecture (amd64, arm64, etc.)
+# - os: Operating system (linux, windows)
+# - variant: Architecture variant (v8, etc.)
+# - source_uri: Repository the image was built from (attestation or OCI label)
+# - source_revision: Commit the image was built from (attestation or OCI label)
+
+aws_ecr_mapping = OntologyMapping(
+    module_name="aws",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="AWSECRImage",
+            fields=[
+                OntologyFieldMapping(ontology_field="digest", node_field="digest"),
+                OntologyFieldMapping(
+                    ontology_field="architecture", node_field="architecture"
+                ),
+                OntologyFieldMapping(ontology_field="os", node_field="os"),
+                OntologyFieldMapping(
+                    ontology_field="source_uri", node_field="source_uri"
+                ),
+                OntologyFieldMapping(
+                    ontology_field="source_revision", node_field="source_revision"
+                ),
+            ],
+        ),
+    ],
+)
+
+gcp_mapping = OntologyMapping(
+    module_name="gcp",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="GCPArtifactRegistryImage",
+            fields=[
+                OntologyFieldMapping(ontology_field="digest", node_field="digest"),
+                OntologyFieldMapping(
+                    ontology_field="architecture", node_field="architecture"
+                ),
+                OntologyFieldMapping(ontology_field="os", node_field="os"),
+                OntologyFieldMapping(ontology_field="variant", node_field="variant"),
+                OntologyFieldMapping(
+                    ontology_field="source_uri", node_field="source_uri"
+                ),
+                OntologyFieldMapping(
+                    ontology_field="source_revision", node_field="source_revision"
+                ),
+            ],
+        ),
+    ],
+)
+
+gitlab_mapping = OntologyMapping(
+    module_name="gitlab",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="GitLabContainerImage",
+            fields=[
+                OntologyFieldMapping(ontology_field="digest", node_field="digest"),
+                OntologyFieldMapping(ontology_field="uri", node_field="uri"),
+                OntologyFieldMapping(
+                    ontology_field="architecture", node_field="architecture"
+                ),
+                OntologyFieldMapping(ontology_field="os", node_field="os"),
+                OntologyFieldMapping(
+                    ontology_field="source_uri", node_field="source_uri"
+                ),
+                OntologyFieldMapping(
+                    ontology_field="source_revision", node_field="source_revision"
+                ),
+            ],
+        ),
+    ],
+)
+
+github_mapping = OntologyMapping(
+    module_name="github",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="GitHubContainerImage",
+            fields=[
+                OntologyFieldMapping(ontology_field="digest", node_field="digest"),
+                OntologyFieldMapping(ontology_field="uri", node_field="uri"),
+                OntologyFieldMapping(
+                    ontology_field="architecture", node_field="architecture"
+                ),
+                OntologyFieldMapping(ontology_field="os", node_field="os"),
+                OntologyFieldMapping(ontology_field="variant", node_field="variant"),
+                OntologyFieldMapping(
+                    ontology_field="source_uri", node_field="source_uri"
+                ),
+                OntologyFieldMapping(
+                    ontology_field="source_revision", node_field="source_revision"
+                ),
+            ],
+        ),
+    ],
+)
+
+scaleway_mapping = OntologyMapping(
+    module_name="scaleway",
+    nodes=[
+        OntologyNodeMapping(
+            node_label="ScalewayContainerRegistryImage",
+            fields=[
+                OntologyFieldMapping(ontology_field="digest", node_field="digest"),
+                # Scaleway's registry API exposes no per-digest architecture/os
+                # or manifest-list metadata, so only the digest and the source
+                # fields are mapped.
+                OntologyFieldMapping(
+                    ontology_field="source_uri", node_field="source_uri"
+                ),
+                OntologyFieldMapping(
+                    ontology_field="source_revision", node_field="source_revision"
+                ),
+            ],
+        ),
+    ],
+)
+
+IMAGES_ONTOLOGY_MAPPING: dict[str, OntologyMapping] = {
+    "aws": aws_ecr_mapping,
+    "gcp": gcp_mapping,
+    "github": github_mapping,
+    "gitlab": gitlab_mapping,
+    "scaleway": scaleway_mapping,
+    "snowflake": OntologyMapping(
+        module_name="snowflake",
+        nodes=[
+            OntologyNodeMapping(
+                node_label="SnowflakeImage",
+                fields=[
+                    OntologyFieldMapping(
+                        ontology_field="digest", node_field="digest", required=True
+                    ),
+                    OntologyFieldMapping(ontology_field="uri", node_field="image_path"),
+                    # architecture / os / variant: the image-repository listing
+                    # reports no platform metadata.
+                ],
+            ),
+        ],
+    ),
+}

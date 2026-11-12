@@ -1,0 +1,245 @@
+from dataclasses import dataclass
+
+from cartography.models.core.common import PropertyRef
+from cartography.models.core.nodes import CartographyNodeProperties
+from cartography.models.core.nodes import CartographyNodeSchema
+from cartography.models.core.nodes import ExtraNodeLabels
+from cartography.models.core.relationships import CartographyRelProperties
+from cartography.models.core.relationships import CartographyRelSchema
+from cartography.models.core.relationships import LinkDirection
+from cartography.models.core.relationships import make_target_node_matcher
+from cartography.models.core.relationships import OtherRelationships
+from cartography.models.core.relationships import TargetNodeMatcher
+from cartography.models.microsoft.extra_labels import ENTRA_IDENTITY
+from cartography.models.microsoft.extra_labels import ENTRA_PRINCIPAL
+from cartography.models.ontology.labels import USER_ACCOUNT
+
+# The user resource in Microsoft Graph exposes hundreds of properties but, in
+# practice, only a small subset is populated in most tenants.  We deliberately
+# model *just* the commonly-used attributes to keep the graph lean.
+
+
+@dataclass(frozen=True)
+class EntraUserNodeProperties(CartographyNodeProperties):
+    id: PropertyRef = PropertyRef("id", description="Entra user ID.")
+    user_principal_name: PropertyRef = PropertyRef(
+        "user_principal_name", description="User principal name."
+    )
+    display_name: PropertyRef = PropertyRef(
+        "display_name", description="Display name of the user."
+    )
+    given_name: PropertyRef = PropertyRef(
+        "given_name", description="Given name of the user."
+    )
+    surname: PropertyRef = PropertyRef("surname", description="Surname of the user.")
+    # The SDK calls this `mail`; we surface it as `email` like the rest of Cartography
+    email: PropertyRef = PropertyRef(
+        "mail", extra_index=True, description="Primary email address of the user."
+    )
+    mobile_phone: PropertyRef = PropertyRef(
+        "mobile_phone", description="Mobile phone number of the user."
+    )
+    business_phones: PropertyRef = PropertyRef(
+        "business_phones", description="Business phone numbers of the user."
+    )
+    job_title: PropertyRef = PropertyRef(
+        "job_title", description="Job title of the user."
+    )
+    department: PropertyRef = PropertyRef(
+        "department", description="Department of the user."
+    )
+    company_name: PropertyRef = PropertyRef(
+        "company_name", description="Company name associated with the user."
+    )
+    office_location: PropertyRef = PropertyRef(
+        "office_location", description="Office location of the user."
+    )
+    employee_id: PropertyRef = PropertyRef(
+        "employee_id", description="Employee identifier of the user."
+    )
+    employee_type: PropertyRef = PropertyRef(
+        "employee_type", description="Employment type of the user."
+    )
+    city: PropertyRef = PropertyRef("city", description="City in the user's address.")
+    state: PropertyRef = PropertyRef(
+        "state", description="State or province in the user's address."
+    )
+    country: PropertyRef = PropertyRef(
+        "country", description="Country or region in the user's address."
+    )
+    preferred_language: PropertyRef = PropertyRef(
+        "preferred_language", description="Preferred language of the user."
+    )
+    account_enabled: PropertyRef = PropertyRef(
+        "account_enabled", description="Whether the user account is enabled."
+    )
+    age_group: PropertyRef = PropertyRef(
+        "age_group", description="Age group classification of the user."
+    )
+    user_type: PropertyRef = PropertyRef(
+        "user_type",
+        description="Graph userType: `Member` for internal users or `Guest` for "
+        "external (B2B) users.",
+    )
+    external_user_state: PropertyRef = PropertyRef(
+        "external_user_state",
+        description="Invitation state of an external user, such as "
+        "`PendingAcceptance` or `Accepted`. Null for users that were not invited.",
+    )
+    manager_id: PropertyRef = PropertyRef(
+        "manager_id", description="Entra user ID of the user's manager."
+    )
+    sign_in_activity_available: PropertyRef = PropertyRef(
+        "sign_in_activity_available",
+        description="Whether the latest user inventory request could read "
+        "signInActivity. When false, sign-in timestamps are null because Graph "
+        "denied access, not because the user never signed in.",
+    )
+    last_sign_in_date_time: PropertyRef = PropertyRef(
+        "last_sign_in_date_time",
+        extra_index=True,
+        description="UTC datetime from signInActivity.lastSignInDateTime: last "
+        "interactive sign-in attempt, including failures. Null means unknown.",
+    )
+    last_non_interactive_sign_in_date_time: PropertyRef = PropertyRef(
+        "last_non_interactive_sign_in_date_time",
+        extra_index=True,
+        description="UTC datetime from signInActivity.lastNonInteractiveSignInDateTime: "
+        "last non-interactive sign-in attempt, including failures. Null means unknown.",
+    )
+    last_successful_sign_in_date_time: PropertyRef = PropertyRef(
+        "last_successful_sign_in_date_time",
+        extra_index=True,
+        description="UTC datetime from signInActivity.lastSuccessfulSignInDateTime: "
+        "last successful interactive or non-interactive sign-in. Not backfilled "
+        "before December 2023. Null when activity was unavailable, or when Graph "
+        "has no recorded successful sign-in for the user.",
+    )
+    mfa_registration_available: PropertyRef = PropertyRef(
+        "mfa_registration_available",
+        description="Whether the latest sync could read the "
+        "userRegistrationDetails report. When false, the MFA properties are null "
+        "because Graph denied access, not because the user has no MFA.",
+    )
+    is_mfa_registered: PropertyRef = PropertyRef(
+        "is_mfa_registered",
+        description="Whether the user has registered a strong authentication "
+        "method for MFA. Null when unknown.",
+    )
+    is_mfa_capable: PropertyRef = PropertyRef(
+        "is_mfa_capable",
+        description="Whether the user has registered a strong authentication "
+        "method that the authentication methods policy allows for MFA. Null when "
+        "unknown.",
+    )
+    mfa_methods_registered: PropertyRef = PropertyRef(
+        "mfa_methods_registered",
+        description="Authentication methods the user has registered, such as "
+        "`microsoftAuthenticatorPush` or `fido2`. Null when unknown.",
+    )
+    risk_available: PropertyRef = PropertyRef(
+        "risk_available",
+        description="Whether the latest sync could read the riskyUsers report. "
+        "When false, the risk properties are null because Graph denied access, "
+        "not because the user carries no risk.",
+    )
+    risk_level: PropertyRef = PropertyRef(
+        "risk_level",
+        extra_index=True,
+        description="Entra ID Protection user risk level, such as `low`, "
+        "`medium`, `high`, `hidden`, or `none`. Null when the user is not "
+        "in the riskyUsers report, or when that report is unavailable "
+        "(it requires Entra ID P2).",
+    )
+    risk_state: PropertyRef = PropertyRef(
+        "risk_state",
+        description="Entra ID Protection risk state, such as `atRisk`, "
+        "`confirmedCompromised`, `remediated`, or `dismissed`. Null when unknown.",
+    )
+    risk_detail: PropertyRef = PropertyRef(
+        "risk_detail",
+        description="Reason for the latest risk state change, such as "
+        "`adminConfirmedUserCompromised`. Null when unknown.",
+    )
+    risk_last_updated_date_time: PropertyRef = PropertyRef(
+        "risk_last_updated_date_time",
+        description="UTC datetime the risk state last changed. Null when unknown.",
+    )
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+class EntraTenantToUserRelProperties(CartographyRelProperties):
+    lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
+
+
+@dataclass(frozen=True)
+# (:EntraUser)-[:REPORTS_TO]->(:EntraUser)
+class EntraUserReportsToRel(CartographyRelSchema):
+    """Links an Entra user to their manager."""
+
+    target_node_label: str = "EntraUser"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {"id": PropertyRef("manager_id")},
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "REPORTS_TO"
+    properties: EntraTenantToUserRelProperties = EntraTenantToUserRelProperties()
+
+
+@dataclass(frozen=True)
+# (:EntraUser)-[:IN_DOMAIN]->(:EntraDomain)
+class EntraUserInDomainRel(CartographyRelSchema):
+    """Links an Entra user to the tenant domain of its user principal name.
+
+    The domain's authentication type says whether Entra ID or an external
+    identity provider signs the user in.
+    """
+
+    target_node_label: str = "EntraDomain"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {
+            "name": PropertyRef("upn_domain"),
+            "tenant_id": PropertyRef("TENANT_ID", set_in_kwargs=True),
+        },
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "IN_DOMAIN"
+    properties: EntraTenantToUserRelProperties = EntraTenantToUserRelProperties()
+
+
+@dataclass(frozen=True)
+# (:EntraUser)<-[:RESOURCE]-(:AzureTenant)
+class EntraUserToTenantRel(CartographyRelSchema):
+    """Links a Microsoft tenant to one of its Entra users."""
+
+    target_node_label: str = "AzureTenant"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {"id": PropertyRef("TENANT_ID", set_in_kwargs=True)},
+    )
+    direction: LinkDirection = LinkDirection.INWARD
+    rel_label: str = "RESOURCE"
+    properties: EntraTenantToUserRelProperties = EntraTenantToUserRelProperties()
+
+
+@dataclass(frozen=True)
+class EntraUserSchema(CartographyNodeSchema):
+    """A user account in Microsoft Entra ID."""
+
+    label: str = "EntraUser"
+    properties: EntraUserNodeProperties = EntraUserNodeProperties()
+    sub_resource_relationship: EntraUserToTenantRel = EntraUserToTenantRel()
+    other_relationships: OtherRelationships = OtherRelationships(
+        [
+            EntraUserReportsToRel(),
+            EntraUserInDomainRel(),
+        ]
+    )
+    extra_node_labels: ExtraNodeLabels = ExtraNodeLabels(
+        [
+            ENTRA_IDENTITY,
+            USER_ACCOUNT,
+            # Cross-provider IAM principal umbrella, mirroring AWSPrincipal / GCPPrincipal.
+            ENTRA_PRINCIPAL,
+        ]  # UserAccount label is used for ontology mapping
+    )
